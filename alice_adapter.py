@@ -273,8 +273,24 @@ alice = AliceClient()
 # Это самая хрупкая часть — тюнится под поведение модели.
 # ============================================================================
 
-# Любой фенс-блок (с языковым тегом или без) — внутри ищем JSON-вызов.
+# Фенс-блок (с языковым тегом или без) — внутри него JSON-вызов.
 FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+
+# Блок «тела» аргумента: строка @@ключ@@ ... строка @@end@@ (или конец текста).
+# Тело берётся дословно — без экранирования и без конфликта с ```.
+BODY_RE = re.compile(
+    r"^@@(?!end@@)([A-Za-z_]\w*)@@[ \t]*\r?\n(.*?)(?:^@@end@@[ \t]*\r?$|\Z)",
+    re.DOTALL | re.MULTILINE)
+
+# Плейсхолдер тела внутри JSON: значение аргумента вида "@@ключ@@".
+PLACEHOLDER_RE = re.compile(r"^@@([A-Za-z_]\w*)@@$")
+
+# Тело целиком в одном ```-фенсе: модель часто оборачивает код, хотя не должна.
+WRAP_RE = re.compile(r"\A```[^\n`]*\r?\n(.*?)\r?\n?```\s*\Z", re.DOTALL)
+
+# Типографские кавычки -> ASCII (модель иногда подставляет их в JSON).
+_QUOTE_FIX = {0x201c: '"', 0x201d: '"', 0x2018: "'", 0x2019: "'",
+              0x00ab: '"', 0x00bb: '"'}
 
 
 def _looks_like_call(obj: Any) -> bool:
@@ -283,13 +299,69 @@ def _looks_like_call(obj: Any) -> bool:
             and isinstance(obj.get("arguments"), dict))
 
 
+def _loads_tolerant(s: str) -> Any:
+    """Терпимый json.loads: чинит типографские кавычки и висячие запятые."""
+    s = s.strip().translate(_QUOTE_FIX)
+    for candidate in (s, re.sub(r",(\s*[}\]])", r"\1", s)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _extract_bodies(text: str) -> tuple[dict[str, list[str]], list[tuple[int, int]]]:
+    """Достаёт блоки @@ключ@@…@@end@@ -> {ключ: [тела по порядку]} и их позиции.
+    Список (а не одно значение) нужен для нескольких вызовов с одинаковым ключом
+    (напр. два write_file, оба с content). Перевод строки перед @@end@@ — разделитель."""
+    bodies: dict[str, list[str]] = {}
+    spans: list[tuple[int, int]] = []
+    for m in BODY_RE.finditer(text):
+        body = m.group(2)
+        if body.endswith("\n"):
+            body = body[:-1]
+        if body.endswith("\r"):
+            body = body[:-1]
+        wrap = WRAP_RE.match(body)  # снять обёртку ```…``` целиком, если есть
+        if wrap:
+            body = wrap.group(1)
+        bodies.setdefault(m.group(1), []).append(body)
+        spans.append(m.span())
+    return bodies, spans
+
+
+def _resolve_bodies(call: dict[str, Any], bodies: dict[str, list[str]]) -> dict[str, Any]:
+    """Подставляет тела вместо плейсхолдеров "@@ключ@@". Тела для одного ключа
+    раздаются ПО ПОРЯДКУ (первый вызов — первое тело, и т.д.), поэтому несколько
+    вызовов с одинаковым ключом не перетирают друг друга."""
+    args = call.get("arguments") or {}
+    for k, v in list(args.items()):
+        if isinstance(v, str):
+            ph = PLACEHOLDER_RE.match(v.strip())
+            if ph and bodies.get(ph.group(1)):
+                args[k] = bodies[ph.group(1)].pop(0)
+    return call
+
+
+def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text.strip()
+    out, prev = [], 0
+    for s, e in sorted(spans):
+        if s >= prev:
+            out.append(text[prev:s])
+            prev = e
+    out.append(text[prev:])
+    return "".join(out).strip()
+
+
 def _mk_call(obj: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": "call_" + uuid.uuid4().hex[:24],
         "type": "function",
         "function": {
             "name": obj["name"],
-            "arguments": json.dumps(obj["arguments"], ensure_ascii=False),
+            "arguments": json.dumps(obj.get("arguments", {}), ensure_ascii=False),
         },
     }
 
@@ -304,14 +376,41 @@ def _content_to_text(content: Any) -> str:
 
 def build_tool_instructions(tools: list[dict[str, Any]]) -> str:
     lines = [
-        "Тебе доступны инструменты. Чтобы ВЫПОЛНИТЬ действие (создать или изменить",
-        "файл, запустить команду), нельзя просто показать код в ответе — нужно вызвать",
-        "инструмент. Вызов — это отдельный блок строго такого вида и ничего вокруг:",
+        "Тебе доступны инструменты. Чтобы ВЫПОЛНИТЬ действие (создать/изменить файл,",
+        "запустить команду), нельзя просто показать код в ответе — нужно вызвать",
+        "инструмент. Вызов — отдельный блок строго такого вида:",
         "```tool_call",
-        '{"name": "имя_функции", "arguments": {"параметр": "значение"}}',
+        '{"name": "имя", "arguments": {"параметр": "значение"}}',
         "```",
-        "Внутри блока — только корректный JSON с полями name и arguments. Не добавляй",
-        "пояснений внутри блока. Если инструмент не нужен — отвечай обычным текстом.",
+        "Внутри блока — только корректный JSON (поля name и arguments), без пояснений.",
+        "",
+        "ВАЖНО про большой текст (содержимое файла в content, а также old/new у",
+        "edit_file): НЕ вставляй его прямо в JSON. Вместо значения поставь плейсхолдер",
+        '"@@имяполя@@", а сам текст приведи ПОСЛЕ блока — дословно, между строками',
+        "@@имяполя@@ и @@end@@. Тело приводи КАК ЕСТЬ, без обрамления тройными",
+        "кавычками ``` — это содержимое файла, а не блок кода для показа. Тогда не",
+        "нужно экранировать кавычки и переводы строк. Пример записи файла:",
+        "```tool_call",
+        '{"name": "write_file", "arguments": {"path": "app.py", "content": "@@content@@"}}',
+        "```",
+        "@@content@@",
+        "import sys",
+        'print("привет")',
+        "@@end@@",
+        "",
+        "Пример правки (два тела — по именам аргументов old и new):",
+        "```tool_call",
+        '{"name": "edit_file", "arguments": {"path": "app.py", "old": "@@old@@", "new": "@@new@@"}}',
+        "```",
+        "@@old@@",
+        "def foo(): pass",
+        "@@end@@",
+        "@@new@@",
+        "def foo(): return 42",
+        "@@end@@",
+        "",
+        "Простые инструменты (read_file, list_dir, glob, grep, run_command) вызывай",
+        "обычным JSON без тел. Если инструмент не нужен — отвечай обычным текстом.",
         "Доступные инструменты:",
     ]
     for t in tools:
@@ -321,6 +420,25 @@ def build_tool_instructions(tools: list[dict[str, Any]]) -> str:
         params = json.dumps(fn.get("parameters", {}), ensure_ascii=False)
         lines.append(f"- {name}: {desc}\n  параметры (JSON Schema): {params}")
     return "\n".join(lines)
+
+
+def _abbrev_args(arguments: str, threshold: int = 500) -> str:
+    """Компактно рендерит аргументы прошлого вызова: длинные строки (тело файла и
+    т.п.) заменяет на «<N символов>», чтобы не раздувать историю. Точный текст
+    модель при необходимости перечитает через read_file."""
+    try:
+        d = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return (arguments or "")[:threshold]
+    if not isinstance(d, dict):
+        return str(d)[:threshold]
+    out = []
+    for k, v in d.items():
+        if isinstance(v, str) and len(v) > threshold:
+            out.append(f"{k}=<{len(v)} символов>")
+        else:
+            out.append(f"{k}={v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}")
+    return ", ".join(out)
 
 
 def render_messages_to_prompt(
@@ -338,69 +456,60 @@ def render_messages_to_prompt(
     if tools:
         parts.append(build_tool_instructions(tools))
 
+    id_to_name: dict[str, str] = {}
     for m in messages:
         role = m.get("role")
         if role == "system":
             continue
         if role == "user":
-            parts.append("Пользователь:\n" + _content_to_text(m.get("content")))
+            parts.append("[Пользователь]\n" + _content_to_text(m.get("content")))
         elif role == "assistant":
             txt = _content_to_text(m.get("content"))
             if txt:
-                parts.append("Ассистент:\n" + txt)
+                parts.append("[Ассистент]\n" + txt)
             for tc in m.get("tool_calls", []) or []:
                 fn = tc.get("function", {})
-                parts.append(
-                    f"Ассистент вызвал инструмент {fn.get('name')} "
-                    f"с аргументами {fn.get('arguments')}"
-                )
+                name = fn.get("name", "")
+                id_to_name[tc.get("id")] = name
+                parts.append(f"[Ассистент вызвал] {name}({_abbrev_args(fn.get('arguments', ''))})")
         elif role == "tool":
-            parts.append(
-                f"Результат инструмента (id={m.get('tool_call_id')}):\n"
-                + _content_to_text(m.get("content"))
-            )
+            name = id_to_name.get(m.get("tool_call_id"), "")
+            head = f"[Результат: {name}]" if name else "[Результат инструмента]"
+            parts.append(head + "\n" + _content_to_text(m.get("content")))
 
-    parts.append("Ассистент:")
+    parts.append("[Ассистент]")
     return "\n\n".join(parts)
 
 
 def parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Достаёт вызовы инструментов из ответа модели -> (чистый_текст, [tool_calls]).
+    """Текст ответа -> (чистый_текст, [tool_calls]).
 
-    Тег фенса может быть любым (```tool_call, ```json или просто ```) — вызов
-    распознаём по СОДЕРЖИМОМУ (валидный JSON с полями name+arguments), а не по тегу.
-    Обычные примеры кода (```python и т.п.) не парсятся как такой JSON и вызовами
-    не считаются. Фолбэк: весь ответ — голый JSON-вызов без фенса."""
+    Структура вызова — JSON в фенсе (тег любой; распознаём по полям name+arguments).
+    Объёмные аргументы (content/old/new) могут приходить телом @@ключ@@…@@end@@ вне
+    JSON (без экранирования и без конфликта с ```), а в JSON стоять плейсхолдером
+    "@@ключ@@". JSON парсится терпимо. Если тело пришло прямо в JSON (старый формат)
+    — тоже работает. Обычный код в ```python вызовом не считается."""
+    bodies, body_spans = _extract_bodies(text)
+
     tool_calls: list[dict[str, Any]] = []
-    spans: list[tuple[int, int]] = []
+    call_spans: list[tuple[int, int]] = []
     for m in FENCE_RE.finditer(text):
-        try:
-            obj = json.loads(m.group(1).strip())
-        except json.JSONDecodeError:
-            continue
+        obj = _loads_tolerant(m.group(1))
         candidates = obj if isinstance(obj, list) else [obj]
         matched = [c for c in candidates if _looks_like_call(c)]
         if matched:
-            tool_calls.extend(_mk_call(c) for c in matched)
-            spans.append(m.span())
+            for c in matched:
+                tool_calls.append(_mk_call(_resolve_bodies(c, bodies)))
+            call_spans.append(m.span())
 
     if tool_calls:
-        clean_parts, prev = [], 0
-        for s, e in spans:
-            clean_parts.append(text[prev:s])
-            prev = e
-        clean_parts.append(text[prev:])
-        return "".join(clean_parts).strip(), tool_calls
+        return _strip_spans(text, call_spans + body_spans), tool_calls
 
-    # фолбэк: весь ответ — голый JSON-вызов (без фенса)
-    stripped = text.strip()
-    try:
-        obj = json.loads(stripped)
-        if _looks_like_call(obj):
-            return "", [_mk_call(obj)]
-    except json.JSONDecodeError:
-        pass
-    return stripped, []
+    # фолбэк: весь ответ — голый JSON-вызов без фенса
+    obj = _loads_tolerant(text)
+    if _looks_like_call(obj):
+        return "", [_mk_call(_resolve_bodies(obj, bodies))]
+    return text.strip(), []
 
 
 # ============================================================================

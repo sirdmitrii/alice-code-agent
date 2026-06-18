@@ -306,30 +306,69 @@ def wait_health(timeout: float = 25.0) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Подтверждение опасных операций
+# Уровень доверия и подтверждение операций
 # ---------------------------------------------------------------------------
 
-def confirm(name: str, args: dict, auto: set) -> bool:
-    if name in auto:
-        return True
-    preview = json.dumps(args, ensure_ascii=False)
-    if len(preview) > 400:
-        preview = preview[:400] + "…"
-    console.print(Panel(preview, title=f"[yellow]Выполнить {name}?[/]", border_style="yellow"))
-    ans = Prompt.ask("[y]да / [n]нет / [a]разрешить всё до конца сессии",
+# all — спрашивать на ВСЕ вызовы; danger — только на опасные (по умолчанию);
+# none — не запрашивать подтверждения вовсе. Переключается командой /trust.
+TRUST_MODES = {
+    "all": "подтверждать все операции",
+    "danger": "подтверждать только опасные (запись/правка/команды)",
+    "none": "не запрашивать подтверждения",
+}
+
+
+class Trust:
+    def __init__(self, mode: str = "danger") -> None:
+        self.mode = mode
+
+    def needs_confirm(self, name: str) -> bool:
+        if self.mode == "none":
+            return False
+        if self.mode == "all":
+            return True
+        return name in DANGEROUS  # режим danger
+
+
+def _args_preview(arguments: str) -> str:
+    try:
+        args = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    return ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items())
+
+
+def confirm_batch(calls: list) -> str:
+    """Одно подтверждение сразу на все переданные вызовы. -> 'yes' | 'no' | 'always'."""
+    lines = [f"• {tc.function.name}({_args_preview(tc.function.arguments)})"
+             for tc in calls]
+    title = "Выполнить операцию?" if len(calls) == 1 else f"Выполнить {len(calls)} операции?"
+    console.print(Panel("\n".join(lines), title=f"[yellow]{title}[/]", border_style="yellow"))
+    ans = Prompt.ask("[y]да / [n]нет / [a]больше не спрашивать в этой сессии",
                      choices=["y", "n", "a"], default="y")
-    if ans == "a":
-        auto.add(name)
-        return True
-    return ans == "y"
+    return {"y": "yes", "n": "no", "a": "always"}[ans]
 
 
 # ---------------------------------------------------------------------------
 # Один ход агента: крутим модель, пока она вызывает инструменты
 # ---------------------------------------------------------------------------
 
-def agent_turn(client: OpenAI, messages: list, auto: set,
+# Осиротевшие маркеры тела (@@поле@@ / @@end@@ в начале строки) — признак того,
+# что модель пыталась вызвать инструмент по нашему протоколу, но сломала формат.
+_BROKEN_CALL_RE = re.compile(r"(?m)^@@(?:end|[A-Za-z_]\w*)@@\s*$")
+
+
+def _looks_like_broken_call(text: str) -> bool:
+    """Похоже на попытку вызова, которую парсер не смог распознать: остался фенс
+    tool_call или осиротевшие маркеры тела."""
+    if not text:
+        return False
+    return "```tool_call" in text or bool(_BROKEN_CALL_RE.search(text))
+
+
+def agent_turn(client: OpenAI, messages: list, trust: "Trust",
                dialog_id: Optional[str] = None) -> None:
+    repairs_left = 2  # сколько раз просим Алису повторить сломанный вызов
     for _ in range(25):  # предохранитель от бесконечного цикла
         with console.status("[dim]Alice думает…[/]", spinner="dots"):
             resp = client.chat.completions.create(
@@ -338,8 +377,21 @@ def agent_turn(client: OpenAI, messages: list, auto: set,
             )
         msg = resp.choices[0].message
 
-        # финальный ответ без инструментов
+        # ответ без инструментов
         if not msg.tool_calls:
+            # битый вызов? просим повторить, а не завершаем молча
+            if msg.content and repairs_left > 0 and _looks_like_broken_call(msg.content):
+                repairs_left -= 1
+                console.print("[yellow]Вызов инструмента сломан — прошу Алису повторить…[/]")
+                messages.append({"role": "assistant", "content": msg.content})
+                messages.append({"role": "user", "content":
+                    "Твой вызов инструмента не распознан — формат сломан. Повтори его "
+                    "СТРОГО блоком ```tool_call``` с корректным JSON (поля name и "
+                    "arguments). Большой текст (content/old/new) выноси телом между "
+                    "@@поле@@ и @@end@@, без обрамления тройными кавычками. "
+                    "Ничего лишнего вокруг блока."})
+                continue
+            # финальный ответ
             if msg.content:
                 console.print(Panel(Markdown(msg.content), title="Alice", border_style="cyan"))
             messages.append({"role": "assistant", "content": msg.content or ""})
@@ -357,16 +409,25 @@ def agent_turn(client: OpenAI, messages: list, auto: set,
                            for tc in msg.tool_calls],
         })
 
+        # одно подтверждение сразу на все вызовы, которым оно нужно по уровню доверия
+        to_confirm = [tc for tc in msg.tool_calls if trust.needs_confirm(tc.function.name)]
+        declined = False
+        if to_confirm:
+            decision = confirm_batch(to_confirm)
+            declined = decision == "no"
+            if decision == "always":
+                trust.mode = "none"
+                console.print("[dim]Уровень доверия → none: больше не спрашиваю в этой сессии.[/]")
+
         for tc in msg.tool_calls:
             name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            shown = ", ".join(f"{k}={str(v)[:40]}" for k, v in args.items())
-            console.print(f"[dim]→ {name}({shown})[/]")
+            console.print(f"[dim]→ {name}({_args_preview(tc.function.arguments)})[/]")
 
-            if name in DANGEROUS and not confirm(name, args, auto):
+            if declined and tc in to_confirm:
                 result = "Пользователь отклонил выполнение."
             else:
                 fn = TOOLS_IMPL.get(name)
@@ -480,7 +541,7 @@ def main() -> None:
     console.print(Panel.fit(
         f"[bold cyan]Alice Code[/]   модель: {MODEL}\n"
         f"папка: {PROJECT_DIR}\n"
-        "[dim]/resume — прошлая сессия · /clear — новая · /exit — выход · /help[/]",
+        "[dim]/resume · /clear · /trust · /exit · /help[/]",
         border_style="cyan"))
 
     # Сессия Алисы: при первом запуске откроется окно браузера для входа в Яндекс
@@ -508,8 +569,9 @@ def main() -> None:
     client = OpenAI(base_url=BASE_URL, api_key="local")
     sess = new_session()
     messages = sess["messages"]
-    auto: set = set()
-    console.print(f"[dim]Новая сессия {sess['id']}.[/]\n")
+    trust = Trust()
+    console.print(f"[dim]Новая сессия {sess['id']}. Уровень доверия: {trust.mode} "
+                  f"({TRUST_MODES[trust.mode]}).[/]\n")
 
     try:
         while True:
@@ -525,7 +587,6 @@ def main() -> None:
             if cmd == "/clear":
                 sess = new_session()
                 messages = sess["messages"]
-                auto.clear()
                 console.print(f"[dim]Новая сессия {sess['id']} (контекст очищен).[/]")
                 continue
             if cmd == "/help":
@@ -533,7 +594,19 @@ def main() -> None:
                     "[dim]Опиши задачу обычным текстом. Многострочная вставка (Ctrl+V) "
                     "и история (↑/↓) поддерживаются.\n"
                     "/resume [id] — вернуться к прошлой сессии · /clear — новая сессия · "
-                    "/exit — выход.[/]")
+                    "/trust — уровень доверия (подтверждения) · /exit — выход.[/]")
+                continue
+            if cmd == "/trust" or cmd.startswith("/trust "):
+                arg = stripped[len("/trust"):].strip().lower()
+                if arg in TRUST_MODES:
+                    trust.mode = arg
+                    console.print(f"[green]Уровень доверия: {arg}[/] "
+                                  f"[dim]— {TRUST_MODES[arg]}[/]")
+                else:
+                    console.print(f"[bold]Текущий уровень доверия:[/] {trust.mode} "
+                                  f"[dim]— {TRUST_MODES[trust.mode]}[/]")
+                    for k, v in TRUST_MODES.items():
+                        console.print(f"  [cyan]/trust {k}[/] — {v}")
                 continue
             if cmd == "/resume" or cmd.startswith("/resume "):
                 chosen = pick_session(stripped[len("/resume"):].strip(),
@@ -541,7 +614,6 @@ def main() -> None:
                 if chosen is not None:
                     sess = chosen
                     messages = sess["messages"]
-                    auto.clear()
                     console.print(f"[green]Вернулся в сессию {sess['id']}[/] "
                                   f"[dim]({session_title(sess)})[/]")
                 continue
@@ -551,7 +623,7 @@ def main() -> None:
             messages.append({"role": "user", "content": user})
             trim_history(messages)
             try:
-                agent_turn(client, messages, auto, sess["dialog_id"])
+                agent_turn(client, messages, trust, sess["dialog_id"])
             except Exception as e:
                 console.print(f"[red]Ошибка запроса: {e}[/]")
             save_session(sess)
