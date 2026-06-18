@@ -1,0 +1,8 @@
+.venv/
+.env
+.alice_profile/
+.alice_creds.json
+__pycache__/
+adapter.log
+.remember/
+setup.log
