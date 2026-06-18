@@ -1,0 +1,26 @@
+{
+  "name": "alice-code-agent",
+  "version": "0.2.2-beta",
+  "private": true,
+  "type": "module",
+  "description": "Кодовый агент (аналог Claude Code) на Яндекс Алисе — порт на TypeScript",
+  "scripts": {
+    "start": "tsx src/agent.ts",
+    "adapter": "tsx src/adapter.ts",
+    "login": "tsx src/session-capture.ts login",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "openai": "^4.77.0",
+    "playwright": "^1.49.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

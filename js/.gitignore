@@ -1,0 +1,5 @@
+node_modules/
+.alice_profile/
+.alice_creds.json
+.alice_sessions/
+*.log
