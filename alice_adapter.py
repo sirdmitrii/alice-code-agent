@@ -180,8 +180,9 @@ class AliceClient:
                 return card["text"]
         return None
 
-    async def _roundtrip(self, creds: "alice_session.Creds", prompt: str) -> str:
-        dialog_id = DIALOG_ID_FIXED or str(uuid.uuid4())
+    async def _roundtrip(self, creds: "alice_session.Creds", prompt: str,
+                         dialog_id: Optional[str] = None) -> str:
+        dialog_id = dialog_id or DIALOG_ID_FIXED or str(uuid.uuid4())
         request_id = str(uuid.uuid4())
         async with ws_connect(
             WS_URL, additional_headers=self._headers(creds),
@@ -193,10 +194,10 @@ class AliceClient:
                 ensure_ascii=False))
             return await self._read_response(ws)
 
-    async def complete(self, prompt: str) -> str:
+    async def complete(self, prompt: str, dialog_id: Optional[str] = None) -> str:
         creds = await alice_session.get_credentials()
         try:
-            return await self._roundtrip(creds, prompt)
+            return await self._roundtrip(creds, prompt, dialog_id)
         except HTTPException:
             # Возможно протухли токен/кука — тихо (headless) обновляем и повторяем.
             try:
@@ -206,7 +207,7 @@ class AliceClient:
                     status_code=502,
                     detail=f"Сессия Алисы недействительна и не обновилась "
                            f"автоматически: {e}. Перезапусти и залогинься заново.")
-            return await self._roundtrip(creds, prompt)
+            return await self._roundtrip(creds, prompt, dialog_id)
 
     async def _read_response(self, ws) -> str:
         """Собирает текст из кадров. Работает в двух режимах:
@@ -489,7 +490,9 @@ async def chat_completions(request: Request) -> Any:
     stream = bool(body.get("stream", False))
 
     prompt = render_messages_to_prompt(messages, tools)
-    text = await alice.complete(prompt)  # один ws-роундтрип к Алисе
+    # dialog_id передаёт агент (extra_body) — чтобы вся сессия шла в один диалог
+    dialog_id = body.get("dialog_id")
+    text = await alice.complete(prompt, dialog_id=dialog_id)  # один ws-роундтрип
 
     if stream:
         return StreamingResponse(

@@ -2,6 +2,7 @@
 .env
 .alice_profile/
 .alice_creds.json
+.alice_sessions/
 __pycache__/
 adapter.log
 .remember/

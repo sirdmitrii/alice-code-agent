@@ -24,13 +24,13 @@ if not exist ".venv\Scripts\python.exe" (
 )
 set "VPY=.venv\Scripts\python.exe"
 
-REM --- dependencies (once) ---
-if not exist ".venv\.deps_ok" (
-  echo [setup] Installing dependencies... this can take a few minutes.
+REM --- dependencies: (re)install if any are missing (self-heals on updates) ---
+"%VPY%" -c "import openai, rich, fastapi, uvicorn, httpx, websockets, playwright, prompt_toolkit" >nul 2>&1
+if errorlevel 1 (
+  echo [setup] Installing/updating dependencies... this can take a few minutes.
   "%VPY%" -m pip install --upgrade pip >>"%LOG%" 2>&1
   "%VPY%" -m pip install -r requirements.txt >>"%LOG%" 2>&1
   if errorlevel 1 ( echo [ERROR] pip install failed - see setup.log & goto :end )
-  echo ok>".venv\.deps_ok"
 )
 
 REM --- Playwright browser for login (once) ---
