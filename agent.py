@@ -7,8 +7,10 @@ agent.py — консольный кодовый агент (аналог Claude
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -142,11 +144,76 @@ def tool_run_command(command: str) -> str:
     return f"exit={r.returncode}\n{out}"
 
 
+# Папки-шум, которые поиск пропускает
+_NOISE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__",
+               ".alice_profile", ".alice_sessions", ".idea", ".mypy_cache",
+               ".pytest_cache", ".ruff_cache", "dist", "build"}
+
+
+def _is_noise(rel: Path) -> bool:
+    return any(part in _NOISE_DIRS for part in rel.parts)
+
+
+def tool_glob(pattern: str, path: str = ".") -> str:
+    base = _safe_path(path)
+    if not base.is_dir():
+        return f"Не директория: {path}"
+    rows = []
+    for m in sorted(base.glob(pattern)):
+        rel = m.relative_to(PROJECT_DIR)
+        if _is_noise(rel):
+            continue
+        rows.append(("[d] " if m.is_dir() else "") + str(rel).replace("\\", "/"))
+        if len(rows) >= 500:
+            rows.append("... [обрезано: >500 совпадений]")
+            break
+    return "\n".join(rows) or "(ничего не найдено)"
+
+
+def tool_grep(pattern: str, path: str = ".", include: str = None,
+              ignore_case: bool = False) -> str:
+    base = _safe_path(path)
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as e:
+        return f"Неверное регулярное выражение: {e}"
+    files = [base] if base.is_file() else [
+        f for f in base.rglob("*") if f.is_file()]
+    hits, scanned = [], 0
+    for f in files:
+        rel = f.relative_to(PROJECT_DIR)
+        if _is_noise(rel):
+            continue
+        if include and not fnmatch.fnmatch(f.name, include):
+            continue
+        try:
+            if f.stat().st_size > 2_000_000:
+                continue
+            data = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if "\x00" in data[:1024]:  # похоже на бинарник — пропускаем
+            continue
+        scanned += 1
+        relstr = str(rel).replace("\\", "/")
+        for i, line in enumerate(data.splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{relstr}:{i}: {line.strip()[:300]}")
+                if len(hits) >= 200:
+                    hits.append("... [обрезано: показаны первые 200 совпадений]")
+                    return "\n".join(hits)
+    if not hits:
+        return f"Совпадений не найдено (просмотрено файлов: {scanned})."
+    return "\n".join(hits)
+
+
 TOOLS_IMPL = {
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
     "list_dir": tool_list_dir,
+    "glob": tool_glob,
+    "grep": tool_grep,
     "run_command": tool_run_command,
 }
 DANGEROUS = {"write_file", "edit_file", "run_command"}  # требуют подтверждения
@@ -174,6 +241,27 @@ TOOLS_SCHEMA = [
         "name": "list_dir", "description": "Показать содержимое директории.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
     {"type": "function", "function": {
+        "name": "glob",
+        "description": "Найти файлы по маске относительно рабочей папки. "
+                       "Поддерживает ** (например, '**/*.py', 'src/**/test_*.py').",
+        "parameters": {"type": "object",
+                       "properties": {"pattern": {"type": "string"},
+                                      "path": {"type": "string",
+                                               "description": "подпапка, по умолчанию ."}},
+                       "required": ["pattern"]}}},
+    {"type": "function", "function": {
+        "name": "grep",
+        "description": "Поиск по содержимому файлов (регулярное выражение). Возвращает "
+                       "строки в формате путь:номер: текст. Пропускает бинарники и "
+                       "служебные папки.",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "pattern": {"type": "string", "description": "regex"},
+                           "path": {"type": "string", "description": "файл или подпапка, по умолчанию ."},
+                           "include": {"type": "string", "description": "фильтр по имени файла, напр. '*.py'"},
+                           "ignore_case": {"type": "boolean"}},
+                       "required": ["pattern"]}}},
+    {"type": "function", "function": {
         "name": "run_command",
         "description": "Выполнить команду в shell (Windows cmd) внутри рабочей папки.",
         "parameters": {"type": "object",
@@ -184,8 +272,9 @@ TOOLS_SCHEMA = [
 SYSTEM_PROMPT = (
     "Ты — кодовый агент в консоли, аналог Claude Code, работаешь на Windows.\n"
     f"Рабочая папка: {PROJECT_DIR}\n"
-    "Действуй пошагово: сначала осмотрись инструментами (list_dir, read_file), "
-    "затем вноси небольшие правки (write_file, edit_file) и при необходимости "
+    "Действуй пошагово: сначала осмотрись инструментами (list_dir, glob — поиск "
+    "файлов по маске, grep — поиск по содержимому, read_file), затем вноси "
+    "небольшие правки (write_file, edit_file) и при необходимости "
     "запускай команды (run_command), проверяя результат. Никогда не выдумывай "
     "содержимое файлов — читай их. Когда задача выполнена, дай краткий итог "
     "обычным текстом, не вызывая инструменты."
