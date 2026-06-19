@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import mimetypes
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -282,6 +284,87 @@ SYSTEM_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
+# Вложения: Ctrl+V пути к файлу (из Проводника) или картинки из буфера обмена.
+# Загружаются в Алису её протоколом (адаптер делает upload), она видит файл.
+# ---------------------------------------------------------------------------
+
+# Форматы, которые принимает веб-Алиса.
+_ATTACH_EXT = {
+    ".txt", ".text", ".md", ".markdown", ".js", ".mjs", ".ts", ".json", ".csv",
+    ".xml", ".html", ".htm", ".shtml", ".shtm", ".ehtml", ".xhtml", ".css",
+    ".xsl", ".xslt", ".xbl", ".vtt", ".ics", ".sh", ".dot", ".doc", ".docx",
+    ".pdf", ".jpg", ".jpeg", ".jpe", ".jfif", ".pjp", ".pjpeg", ".png", ".webp",
+    ".svg", ".gif",
+}
+_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".jpe": "image/jpeg",
+    ".jfif": "image/jpeg", ".pjp": "image/jpeg", ".pjpeg": "image/jpeg",
+    ".png": "image/png", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".gif": "image/gif", ".pdf": "application/pdf", ".csv": "text/csv",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword", ".md": "text/markdown", ".js": "text/javascript",
+    ".mjs": "text/javascript", ".json": "application/json", ".xml": "text/xml",
+    ".html": "text/html", ".htm": "text/html", ".css": "text/css",
+    ".txt": "text/plain", ".sh": "application/x-sh",
+}
+# Путь: в кавычках, либо абсолютный Windows (C:\…) / Unix (/…).
+_PATH_RE = re.compile(r'"([^"]+)"|([A-Za-z]:\\[^\s"]+|/[^\s"]+)')
+
+
+def _is_processing(text: str) -> bool:
+    """Похоже на «файл ещё обрабатывается, спросите позже»."""
+    t = (text or "").lower()
+    return any(w in t for w in ("обрабатыва", "спросите поз", "попозже"))
+
+
+def _guess_mime(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _MIME:
+        return _MIME[ext]
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+
+def _att(path: str) -> dict:
+    return {"path": path, "mime_type": _guess_mime(path), "title": os.path.basename(path)}
+
+
+def detect_attachments(text: str) -> tuple[list, str]:
+    """Находит в тексте пути к файлам поддерживаемых форматов; если их нет —
+    пробует буфер обмена (картинка/файлы) через Pillow. Возвращает
+    (список_вложений, текст_без_путей)."""
+    atts, spans = [], []
+    for m in _PATH_RE.finditer(text):
+        cand = (m.group(1) or m.group(2) or "").strip().strip('"')
+        ext = os.path.splitext(cand)[1].lower()
+        if ext in _ATTACH_EXT and os.path.isfile(cand):
+            atts.append(_att(cand))
+            spans.append(m.span())
+    if spans:
+        out, prev = [], 0
+        for s, e in spans:
+            out.append(text[prev:s])
+            prev = e
+        out.append(text[prev:])
+        text = " ".join("".join(out).split())
+
+    if not atts:  # буфер обмена: скриншот или скопированные файлы
+        try:
+            from PIL import ImageGrab
+            cb = ImageGrab.grabclipboard()
+            if isinstance(cb, list):
+                for p in cb:
+                    if os.path.splitext(p)[1].lower() in _ATTACH_EXT and os.path.isfile(p):
+                        atts.append(_att(p))
+            elif cb is not None and hasattr(cb, "save"):
+                tmp = os.path.join(tempfile.gettempdir(), f"alice_clip_{uuid.uuid4().hex[:8]}.png")
+                cb.save(tmp, "PNG")
+                atts.append(_att(tmp))
+        except Exception:
+            pass
+    return atts, text
+
+
+# ---------------------------------------------------------------------------
 # Запуск и ожидание адаптера
 # ---------------------------------------------------------------------------
 
@@ -367,13 +450,17 @@ def _looks_like_broken_call(text: str) -> bool:
 
 
 def agent_turn(client: OpenAI, messages: list, trust: "Trust",
-               dialog_id: Optional[str] = None) -> None:
+               dialog_id: Optional[str] = None, attachments: Optional[list] = None) -> None:
     repairs_left = 2  # сколько раз просим Алису повторить сломанный вызов
+    pending_att = attachments  # вложения шлём только на первом вызове хода
     for _ in range(25):  # предохранитель от бесконечного цикла
+        extra: dict = {"dialog_id": dialog_id} if dialog_id else {}
+        if pending_att:
+            extra["attachments"] = pending_att
+            pending_att = None
         with console.status("[dim]Alice думает…[/]", spinner="dots"):
             resp = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS_SCHEMA,
-                extra_body={"dialog_id": dialog_id} if dialog_id else {},
+                model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
             )
         msg = resp.choices[0].message
 
@@ -593,6 +680,8 @@ def main() -> None:
                 console.print(
                     "[dim]Опиши задачу обычным текстом. Многострочная вставка (Ctrl+V) "
                     "и история (↑/↓) поддерживаются.\n"
+                    "Прикрепить файл: Ctrl+V путь к файлу (скопируй файл в Проводнике) "
+                    "или скриншот из буфера — Алиса его прочитает.\n"
                     "/resume [id] — вернуться к прошлой сессии · /clear — новая сессия · "
                     "/trust — уровень доверия (подтверждения) · /exit — выход.[/]")
                 continue
@@ -620,10 +709,27 @@ def main() -> None:
             if not stripped:
                 continue
 
-            messages.append({"role": "user", "content": user})
+            atts, cleaned = detect_attachments(user)
+            if atts:
+                console.print("[dim]📎 прикреплено: "
+                              + ", ".join(a["title"] for a in atts) + "[/]")
+                messages.append({"role": "user",
+                                 "content": cleaned.strip() or "Посмотри прикреплённый файл."})
+            else:
+                messages.append({"role": "user", "content": user})
             trim_history(messages)
             try:
-                agent_turn(client, messages, trust, sess["dialog_id"])
+                agent_turn(client, messages, trust, sess["dialog_id"],
+                           attachments=atts or None)
+                # файл загружается асинхронно: если Алиса «обрабатывает» —
+                # подождём и переспросим один раз
+                if atts and messages and messages[-1].get("role") == "assistant" \
+                        and _is_processing(messages[-1].get("content", "")):
+                    console.print("[dim]Файл ещё обрабатывается — жду и переспрашиваю…[/]")
+                    time.sleep(6)
+                    messages.append({"role": "user",
+                                     "content": "Файл обработан? Ответь по его содержимому."})
+                    agent_turn(client, messages, trust, sess["dialog_id"])
             except Exception as e:
                 console.print(f"[red]Ошибка запроса: {e}[/]")
             save_session(sess)

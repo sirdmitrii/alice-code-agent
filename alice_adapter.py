@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import re
+import struct
 import time
 import uuid
 from typing import Any, AsyncIterator, Optional
@@ -81,14 +82,23 @@ EXPERIMENTS = [
     "enable_new_colors_for_alice_chat",
     "erase_serialized_response_from_json_deferred_alice_response",
     "skills_standalone_use_div_render", "standalone_skill_card_cloud_ui",
+    "alice_enable_generate_video", "aliceapp_enable_generate_video",
+    "alice_video_generation_soon", "new_input_bts",
 ]
 SUPPORTED_FEATURES = [
-    "background_response_streaming", "supports_bso_answer", "open_link",
-    "server_action", "div2_cards", "supports_streaming_response",
-    "supports_rich_json_cards", "supports_markdown_response",
-    "print_text_in_message_view", "show_loader_directive",
-    "supports_default_dialog_as_dedicated", "supports_multi_model_dialogs",
-    "supports_unlimited_dialogs_creation",
+    "background_response_streaming_for_dialog_controls",
+    "background_response_streaming_in_read_dialog",
+    "background_response_streaming_anon", "background_response_streaming",
+    "supports_bso_answer", "open_link", "server_action", "show_promo",
+    "reminders_and_todos", "div2_cards", "player_pause_directive",
+    "can_open_dialogs_in_tabs", "supports_streaming_response",
+    "supports_rich_json_cards", "builtin_reaction", "open_link_by_button",
+    "supports_origin_in_separate_card", "supports_new_sources_cards",
+    "supports_markdown_response", "supported_save_chathistory",
+    "supported_load_chathistory", "supports_unlimited_dialogs_creation",
+    "supports_multi_model_dialogs", "print_text_in_message_view",
+    "show_loader_directive", "supports_stringbody_in_div2_card",
+    "supports_default_dialog_as_dedicated", "whisper",
 ]
 
 
@@ -108,10 +118,10 @@ class AliceClient:
         client_time = time.strftime("%Y%m%dT%H%M%S", time.gmtime(ts + 3 * 3600))
         return client_time, str(ts)
 
-    def _sync_state(self, creds: "alice_session.Creds") -> dict[str, Any]:
+    def _sync_state(self, creds: "alice_session.Creds", seq: int = 1) -> dict[str, Any]:
         return {"event": {
             "header": {"namespace": "System", "name": "SynchronizeState",
-                       "seqNumber": 1, "messageId": str(uuid.uuid4())},
+                       "seqNumber": seq, "messageId": str(uuid.uuid4())},
             "payload": {
                 "auth_token": creds.auth_token,
                 "uuid": creds.uuid,
@@ -127,11 +137,29 @@ class AliceClient:
             }}}
 
     def _text_input(self, creds: "alice_session.Creds", text: str,
-                    request_id: str, dialog_id: str) -> dict[str, Any]:
+                    request_id: str, dialog_id: str, seq: int = 2,
+                    attached_files: Optional[list] = None) -> dict[str, Any]:
         client_time, ts = self._now()
+        event: dict[str, Any] = {"type": "text_input", "text": text}
+        if attached_files:
+            # вложения идут ВНУТРЬ event, и достаточно только guid
+            event["attached_files"] = [{"guid": af["guid"]} for af in attached_files]
+        request: dict[str, Any] = {
+            "event": event,
+            "voice_session": False,
+            "experiments": EXPERIMENTS,
+            "uniproxy_options": {
+                "background_response_streaming_options": {"request_with_shown_new_dialog": {}}},
+            "additional_options": {
+                "bass_options": {"user_agent": USER_AGENT, "screen_scale_factor": 1},
+                "origin_domain": "yandex.ru",
+                "supported_features": SUPPORTED_FEATURES,
+                "unsupported_features": [],
+                "icookie": creds.icookie},
+        }
         return {"event": {
             "header": {"namespace": "Vins", "name": "TextInput",
-                       "seqNumber": 2, "messageId": str(uuid.uuid4())},
+                       "seqNumber": seq, "messageId": str(uuid.uuid4())},
             "payload": {
                 "application": {
                     "app_id": "ru.yandex.webstandalone.desktop",
@@ -142,18 +170,7 @@ class AliceClient:
                     "timezone": "Europe/Moscow", "timestamp": ts},
                 "header": {"request_id": request_id, "dialog_id": dialog_id,
                            "dialog_type": 2},
-                "request": {
-                    "event": {"type": "text_input", "text": text},
-                    "voice_session": False,
-                    "experiments": EXPERIMENTS,
-                    "additional_options": {
-                        "bass_options": {"user_agent": USER_AGENT,
-                                         "screen_scale_factor": 1},
-                        "origin_domain": "yandex.ru",
-                        "supported_features": SUPPORTED_FEATURES,
-                        "unsupported_features": [],
-                        "icookie": creds.icookie},
-                },
+                "request": request,
                 "format": "audio/ogg;codecs=opus",
                 "mime": "audio/webm;codecs=opus",
                 "topic": "desktopgeneral", "punctuation": False,
@@ -180,24 +197,121 @@ class AliceClient:
                 return card["text"]
         return None
 
+    @staticmethod
+    def _pong(ref: Optional[str]) -> dict[str, Any]:
+        return {"event": {"header": {"namespace": "System", "name": "Pong",
+                                     "messageId": str(uuid.uuid4()), "refMessageId": ref},
+                          "payload": {}}}
+
+    @staticmethod
+    def _client_subscription_state(seq: int, dialog_id: str) -> dict[str, Any]:
+        # подписываемся на текущий диалог как активный — чтобы загруженный файл
+        # привязался к нему
+        return {"event": {"header": {"namespace": "System", "name": "ClientSubscriptionState",
+                                     "seqNumber": seq, "messageId": str(uuid.uuid4())},
+                          "payload": {"subscriptions": [
+                              {"id": dialog_id, "state": {"full_content": {}}}]}}}
+
+    async def _pump(self, ws, want: str) -> dict[str, Any]:
+        """Читает кадры (отвечая Pong на серверный Ping), пока в payload директивы
+        не появится ключ `want`; возвращает этот payload."""
+        while True:
+            raw = await asyncio.wait_for(ws.recv(), timeout=REQUEST_TIMEOUT)
+            if isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                frame = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            directive = frame.get("directive") or {}
+            name = (directive.get("header") or {}).get("name")
+            payload = directive.get("payload") or {}
+            if name == "Ping":
+                await ws.send(json.dumps(
+                    self._pong((directive.get("header") or {}).get("messageId")),
+                    ensure_ascii=False))
+                continue
+            if isinstance(payload, dict) and want in payload:
+                return payload
+
+    async def _upload_one(self, ws, att: dict, sid: int, nxt) -> Optional[dict]:
+        """Грузит один файл: start -> ждём ack -> бинарь -> chunk_upload_finish ->
+        возвращает запись attached_files с file_guid. streamcontrol НЕ шлём (ломает)."""
+        path = att.get("path")
+        if not path or not os.path.isfile(path):
+            return None
+        with open(path, "rb") as f:
+            data = f.read()
+        title = att.get("title") or os.path.basename(path)
+        mime = att.get("mime_type") or "application/octet-stream"
+        start_id = str(uuid.uuid4())
+        await ws.send(json.dumps({"event": {
+            "header": {"namespace": "File", "name": "Upload", "streamId": sid,
+                       "seqNumber": nxt(), "messageId": start_id},
+            "payload": {"file_upload_start": {"mime_type": mime, "size": len(data),
+                                              "title": title, "origin": "Chat"}}}},
+            ensure_ascii=False))
+        await self._pump(ws, "file_upload_start")          # ack «поток готов»
+        await ws.send(struct.pack(">I", sid) + data)        # [4 байта BE streamId][байты]
+        await ws.send(json.dumps({"event": {
+            "header": {"namespace": "File", "name": "Upload", "streamId": sid,
+                       "refMessageId": start_id, "seqNumber": nxt(),
+                       "messageId": str(uuid.uuid4())},
+            "payload": {"chunk_upload_finish": {"is_last": True}}}}, ensure_ascii=False))
+        fin = (await self._pump(ws, "file_upload_finish"))["file_upload_finish"]
+        # streamcontrol шлём ПОСЛЕ file_upload_finish (как браузер) — закрывает поток
+        # и финализирует файл; если послать раньше — сервер рвёт связь HasHeader
+        await ws.send(json.dumps({"streamcontrol": {
+            "action": 0, "reason": 0, "streamId": sid, "messageId": start_id}},
+            ensure_ascii=False))
+        return {"guid": fin.get("file_guid"),
+                "file_extension": fin.get("extension", ""),
+                "title": fin.get("title", title),
+                "size_bytes": str(fin.get("size_bytes", len(data))),
+                "mime_type": fin.get("mime_type", mime),
+                "preview_url": fin.get("preview_url", "")}
+
     async def _roundtrip(self, creds: "alice_session.Creds", prompt: str,
-                         dialog_id: Optional[str] = None) -> str:
+                         dialog_id: Optional[str] = None,
+                         attachments: Optional[list] = None) -> str:
         dialog_id = dialog_id or DIALOG_ID_FIXED or str(uuid.uuid4())
         request_id = str(uuid.uuid4())
+        seq = 0
+
+        def nxt() -> int:
+            nonlocal seq
+            seq += 1
+            return seq
+
+        # При вложениях отключаем permessage-deflate: Python websockets сжимает
+        # все кадры, а сервер Алисы ломается на сжатом мелком streamcontrol
+        # (Chromium такие мелкие кадры шлёт без сжатия). Для обычного чата
+        # сжатие оставляем.
+        compression = None if attachments else "deflate"
         async with ws_connect(
             WS_URL, additional_headers=self._headers(creds),
             max_size=None, open_timeout=20, close_timeout=5,
+            compression=compression,
         ) as ws:
-            await ws.send(json.dumps(self._sync_state(creds), ensure_ascii=False))
+            await ws.send(json.dumps(self._sync_state(creds, nxt()), ensure_ascii=False))
+            attached_files: list = []
+            if attachments:
+                await ws.send(json.dumps(
+                    self._client_subscription_state(nxt(), dialog_id), ensure_ascii=False))
+                for i, att in enumerate(attachments, 1):
+                    af = await self._upload_one(ws, att, i, nxt)
+                    if af:
+                        attached_files.append(af)
             await ws.send(json.dumps(
-                self._text_input(creds, prompt, request_id, dialog_id),
+                self._text_input(creds, prompt, request_id, dialog_id, nxt(), attached_files),
                 ensure_ascii=False))
             return await self._read_response(ws)
 
-    async def complete(self, prompt: str, dialog_id: Optional[str] = None) -> str:
+    async def complete(self, prompt: str, dialog_id: Optional[str] = None,
+                       attachments: Optional[list] = None) -> str:
         creds = await alice_session.get_credentials()
         try:
-            return await self._roundtrip(creds, prompt, dialog_id)
+            return await self._roundtrip(creds, prompt, dialog_id, attachments)
         except HTTPException:
             # Возможно протухли токен/кука — тихо (headless) обновляем и повторяем.
             try:
@@ -207,7 +321,7 @@ class AliceClient:
                     status_code=502,
                     detail=f"Сессия Алисы недействительна и не обновилась "
                            f"автоматически: {e}. Перезапусти и залогинься заново.")
-            return await self._roundtrip(creds, prompt, dialog_id)
+            return await self._roundtrip(creds, prompt, dialog_id, attachments)
 
     async def _read_response(self, ws) -> str:
         """Собирает текст из кадров. Работает в двух режимах:
@@ -243,6 +357,11 @@ class AliceClient:
             header = directive.get("header") or {}
             name = header.get("name")
             payload = directive.get("payload") or {}
+
+            if name == "Ping":  # отвечаем на серверный пинг, иначе соединение закроют
+                await ws.send(json.dumps(self._pong(header.get("messageId")),
+                                         ensure_ascii=False))
+                continue
 
             if name in ("DeferredAliceResponse", "VinsResponse"):
                 jr = payload.get("json_response") or {}
@@ -599,9 +718,10 @@ async def chat_completions(request: Request) -> Any:
     stream = bool(body.get("stream", False))
 
     prompt = render_messages_to_prompt(messages, tools)
-    # dialog_id передаёт агент (extra_body) — чтобы вся сессия шла в один диалог
+    # dialog_id и attachments передаёт агент через extra_body
     dialog_id = body.get("dialog_id")
-    text = await alice.complete(prompt, dialog_id=dialog_id)  # один ws-роундтрип
+    attachments = body.get("attachments")
+    text = await alice.complete(prompt, dialog_id=dialog_id, attachments=attachments)
 
     if stream:
         return StreamingResponse(
