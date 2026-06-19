@@ -23,15 +23,17 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import queue as _queue
+
 import httpx
 from openai import OpenAI
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Prompt
 
 import alice_session
 
@@ -43,7 +45,9 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-console = Console()
+# force_terminal=True: чтобы цвета сохранялись и под patch_stdout (proxy stdout).
+# file=None -> rich пишет в ТЕКУЩИЙ sys.stdout, поэтому patch_stdout подхватывается сам.
+console = Console(force_terminal=True)
 ROOT = Path(__file__).resolve().parent
 
 # Ввод через prompt_toolkit: bracketed paste включён по умолчанию, поэтому
@@ -61,6 +65,17 @@ def read_user_input() -> str:
     if _input_session is None:
         _input_session = PromptSession(history=InMemoryHistory())
     return _input_session.prompt(ANSI("\x1b[1;32m› \x1b[0m"))
+
+
+def _default_ask(prompt_text: str) -> str:
+    console.print(prompt_text)
+    return read_user_input()
+
+
+# Хук чтения одной строки для подтверждений / выбора сессии. В режиме очереди
+# main() подменяет его на чтение из очереди ответов (чтобы не конфликтовать с
+# фоновым приёмом ввода).
+ASK = _default_ask
 
 
 # ---------------------------------------------------------------------------
@@ -813,9 +828,9 @@ def confirm_batch(calls: list) -> str:
              for tc in calls]
     title = "Выполнить операцию?" if len(calls) == 1 else f"Выполнить {len(calls)} операции?"
     console.print(Panel("\n".join(lines), title=f"[yellow]{title}[/]", border_style="yellow"))
-    ans = Prompt.ask("[y]да / [n]нет / [a]больше не спрашивать в этой сессии",
-                     choices=["y", "n", "a"], default="y")
-    return {"y": "yes", "n": "no", "a": "always"}[ans]
+    ans = ASK("[y]да / [n]нет / [a]больше не спрашивать: ").strip().lower()
+    first = ans[:1] or "y"
+    return {"n": "no", "a": "always"}.get(first, "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -847,10 +862,10 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
         if pending_att:
             extra["attachments"] = pending_att
             pending_att = None
-        with console.status("[dim]Alice думает…[/]", spinner="dots"):
-            resp = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
-            )
+        console.print("[dim]Alice думает…[/]")
+        resp = client.chat.completions.create(
+            model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
+        )
         msg = resp.choices[0].message
 
         # ответ без инструментов
@@ -991,12 +1006,12 @@ def compact_history(client: OpenAI, messages: list, max_chars: int = 60000) -> N
     system, old, recent = messages[0], messages[1:-keep], messages[-keep:]
     rendered = "\n".join(_msg_brief(m) for m in old)[:30000]
     try:
-        with console.status("[dim]Сжимаю историю…[/]", spinner="dots"):
-            resp = client.chat.completions.create(model=MODEL, messages=[
-                {"role": "system", "content": "Ты кратко конспектируешь работу кодового агента."},
-                {"role": "user", "content":
-                    "Сожми в 5-12 пунктов: что сделано, какие файлы менялись/создавались, "
-                    "важные факты и решения для продолжения. Только факты:\n\n" + rendered}])
+        console.print("[dim]Сжимаю историю…[/]")
+        resp = client.chat.completions.create(model=MODEL, messages=[
+            {"role": "system", "content": "Ты кратко конспектируешь работу кодового агента."},
+            {"role": "user", "content":
+                "Сожми в 5-12 пунктов: что сделано, какие файлы менялись/создавались, "
+                "важные факты и решения для продолжения. Только факты:\n\n" + rendered}])
         summary = (resp.choices[0].message.content or "").strip()
     except Exception:
         trim_history(messages, max_chars)
@@ -1076,7 +1091,7 @@ def pick_session(arg: str, exclude_id: str = "") -> Optional[dict]:
     for i, s in enumerate(shown, 1):
         console.print(f"  [cyan]{i:>2}[/] [dim]{s.get('updated', '')}[/]  "
                       f"{s['id']}  {session_title(s)}")
-    ans = Prompt.ask("[bold]Номер сессии[/] (Enter — отмена)", default="").strip()
+    ans = ASK("Номер сессии (Enter — отмена): ").strip()
     if not ans:
         return None
     if ans.isdigit() and 1 <= int(ans) <= len(shown):
@@ -1132,98 +1147,147 @@ def main() -> None:
     console.print(f"[dim]Новая сессия {sess['id']}. Уровень доверия: {trust.mode} "
                   f"({TRUST_MODES[trust.mode]}).[/]\n")
 
-    try:
-        while True:
-            try:
-                user = read_user_input()
-            except (EOFError, KeyboardInterrupt):
-                break
+    global ASK
+    # ---- очередь ввода: читатель (этот поток) копит ввод, обработчик берёт по
+    # порядку. Вывод не перетирает строку ввода благодаря patch_stdout. ----
+    input_q: _queue.Queue = _queue.Queue()
+    answer_q: _queue.Queue = _queue.Queue()
+    confirm_mode = threading.Event()  # обработчик ждёт ответ (подтверждение/выбор)
+    stop = threading.Event()
+    state = {"sess": sess, "messages": messages}  # владелец — обработчик
 
-            stripped = user.strip()
-            cmd = stripped.lower()
-            if cmd in ("/exit", "/quit", "exit", "quit"):
-                break
-            if cmd == "/clear":
-                sess = new_session(sys_prompt)
-                messages = sess["messages"]
-                console.print(f"[dim]Новая сессия {sess['id']} (контекст очищен).[/]")
-                continue
-            if cmd == "/undo":
-                if not _undo_stack:
-                    console.print("[dim]Нечего откатывать.[/]")
+    def ask_via_queue(prompt_text: str) -> str:
+        console.print(prompt_text)
+        confirm_mode.set()
+        try:
+            while not stop.is_set():
+                try:
+                    return answer_q.get(timeout=0.3)
+                except _queue.Empty:
                     continue
-                snap = _undo_stack.pop()
-                for path_str, prev in snap:
-                    pp = Path(path_str)
-                    if prev is None:
-                        if pp.exists():
-                            pp.unlink()
-                    else:
-                        pp.parent.mkdir(parents=True, exist_ok=True)
-                        pp.write_bytes(prev)
-                console.print(f"[green]Откат выполнен ({len(snap)} файлов).[/]")
-                continue
-            if cmd == "/help":
-                console.print(
-                    "[dim]Опиши задачу обычным текстом. Многострочная вставка (Ctrl+V) "
-                    "и история (↑/↓) поддерживаются.\n"
-                    "Прикрепить файл: Ctrl+V путь к файлу (скопируй файл в Проводнике) "
-                    "или скриншот из буфера — Алиса его прочитает.\n"
-                    "/resume [id] — прошлая сессия · /clear — новая · /undo — откатить "
-                    "последнюю правку · /trust — подтверждения · /exit — выход.[/]")
-                continue
-            if cmd == "/trust" or cmd.startswith("/trust "):
-                arg = stripped[len("/trust"):].strip().lower()
-                if arg in TRUST_MODES:
-                    trust.mode = arg
-                    console.print(f"[green]Уровень доверия: {arg}[/] "
-                                  f"[dim]— {TRUST_MODES[arg]}[/]")
-                else:
-                    console.print(f"[bold]Текущий уровень доверия:[/] {trust.mode} "
-                                  f"[dim]— {TRUST_MODES[trust.mode]}[/]")
-                    for k, v in TRUST_MODES.items():
-                        console.print(f"  [cyan]/trust {k}[/] — {v}")
-                continue
-            if cmd == "/resume" or cmd.startswith("/resume "):
-                chosen = pick_session(stripped[len("/resume"):].strip(),
-                                      exclude_id=sess["id"])
-                if chosen is not None:
-                    sess = chosen
-                    messages = sess["messages"]
-                    console.print(f"[green]Вернулся в сессию {sess['id']}[/] "
-                                  f"[dim]({session_title(sess)})[/]")
-                continue
-            if not stripped:
-                continue
+            return ""
+        finally:
+            confirm_mode.clear()
 
-            atts, cleaned = detect_attachments(user)
-            if atts:
-                console.print("[dim]📎 прикреплено: "
-                              + ", ".join(a["title"] for a in atts) + "[/]")
-                messages.append({"role": "user",
-                                 "content": cleaned.strip() or "Посмотри прикреплённый файл."})
+    ASK = ask_via_queue
+
+    def handle_line(line: str) -> None:
+        stripped = line.strip()
+        cmd = stripped.lower()
+        if cmd == "/clear":
+            state["sess"] = new_session(sys_prompt)
+            state["messages"] = state["sess"]["messages"]
+            console.print(f"[dim]Новая сессия {state['sess']['id']} (контекст очищен).[/]")
+            return
+        if cmd == "/undo":
+            if not _undo_stack:
+                console.print("[dim]Нечего откатывать.[/]")
+                return
+            snap = _undo_stack.pop()
+            for path_str, prev in snap:
+                pp = Path(path_str)
+                if prev is None:
+                    if pp.exists():
+                        pp.unlink()
+                else:
+                    pp.parent.mkdir(parents=True, exist_ok=True)
+                    pp.write_bytes(prev)
+            console.print(f"[green]Откат выполнен ({len(snap)} файлов).[/]")
+            return
+        if cmd == "/help":
+            console.print(
+                "[dim]Опиши задачу обычным текстом. Можно печатать следующие задачи, "
+                "пока агент работает — они встанут в очередь. Ctrl+V — вставка пути к "
+                "файлу/скриншота.\n"
+                "/queue — показать очередь · /resume [id] — прошлая сессия · /clear — "
+                "новая · /undo — откат правки · /trust — подтверждения · /exit — выход.[/]")
+            return
+        if cmd == "/trust" or cmd.startswith("/trust "):
+            arg = stripped[len("/trust"):].strip().lower()
+            if arg in TRUST_MODES:
+                trust.mode = arg
+                console.print(f"[green]Уровень доверия: {arg}[/] [dim]— {TRUST_MODES[arg]}[/]")
             else:
-                messages.append({"role": "user", "content": user})
-            compact_history(client, messages)
+                console.print(f"[bold]Текущий уровень доверия:[/] {trust.mode} "
+                              f"[dim]— {TRUST_MODES[trust.mode]}[/]")
+                for k, v in TRUST_MODES.items():
+                    console.print(f"  [cyan]/trust {k}[/] — {v}")
+            return
+        if cmd == "/resume" or cmd.startswith("/resume "):
+            chosen = pick_session(stripped[len("/resume"):].strip(),
+                                  exclude_id=state["sess"]["id"])
+            if chosen is not None:
+                state["sess"] = chosen
+                state["messages"] = chosen["messages"]
+                console.print(f"[green]Вернулся в сессию {chosen['id']}[/] "
+                              f"[dim]({session_title(chosen)})[/]")
+            return
+        if not stripped:
+            return
+
+        sess_, messages_ = state["sess"], state["messages"]
+        atts, cleaned = detect_attachments(line)
+        if atts:
+            console.print("[dim]📎 прикреплено: " + ", ".join(a["title"] for a in atts) + "[/]")
+            messages_.append({"role": "user",
+                              "content": cleaned.strip() or "Посмотри прикреплённый файл."})
+        else:
+            messages_.append({"role": "user", "content": line})
+        compact_history(client, messages_)
+        modified = agent_turn(client, messages_, trust, sess_["dialog_id"],
+                              attachments=atts or None)
+        if atts and messages_ and messages_[-1].get("role") == "assistant" \
+                and _is_processing(messages_[-1].get("content", "")):
+            console.print("[dim]Файл ещё обрабатывается — жду и переспрашиваю…[/]")
+            time.sleep(6)
+            messages_.append({"role": "user",
+                              "content": "Файл обработан? Ответь по его содержимому."})
+            modified = agent_turn(client, messages_, trust, sess_["dialog_id"]) or modified
+        if modified and VERIFY_CMD:
+            run_verification(client, messages_, trust, sess_["dialog_id"])
+        save_session(sess_)
+        rem = input_q.qsize()
+        if rem:
+            console.print(f"[dim](в очереди ещё {rem})[/]")
+
+    def worker() -> None:
+        while not stop.is_set():
             try:
-                modified = agent_turn(client, messages, trust, sess["dialog_id"],
-                                      attachments=atts or None)
-                # файл загружается асинхронно: если Алиса «обрабатывает» —
-                # подождём и переспросим один раз
-                if atts and messages and messages[-1].get("role") == "assistant" \
-                        and _is_processing(messages[-1].get("content", "")):
-                    console.print("[dim]Файл ещё обрабатывается — жду и переспрашиваю…[/]")
-                    time.sleep(6)
-                    messages.append({"role": "user",
-                                     "content": "Файл обработан? Ответь по его содержимому."})
-                    modified = agent_turn(client, messages, trust, sess["dialog_id"]) or modified
-                # верификация после правок (если задана ALICE_VERIFY_CMD)
-                if modified and VERIFY_CMD:
-                    run_verification(client, messages, trust, sess["dialog_id"])
+                line = input_q.get(timeout=0.3)
+            except _queue.Empty:
+                continue
+            if line is None:
+                break
+            try:
+                handle_line(line)
             except Exception as e:
-                console.print(f"[red]Ошибка запроса: {e}[/]")
-            save_session(sess)
+                console.print(f"[red]Ошибка: {e}[/]")
+        stop.set()
+
+    wt = threading.Thread(target=worker, daemon=True)
+    try:
+        with patch_stdout():
+            wt.start()
+            while not stop.is_set():
+                try:
+                    line = read_user_input()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                s = line.strip().lower()
+                if s in ("/exit", "/quit", "exit", "quit"):
+                    break
+                if confirm_mode.is_set():
+                    answer_q.put(line)
+                    continue
+                if s == "/queue":
+                    console.print(f"[dim]В очереди: {input_q.qsize()}[/]")
+                    continue
+                input_q.put(line)
+                if input_q.qsize() > 1:
+                    console.print(f"[dim](в очереди: {input_q.qsize()})[/]")
     finally:
+        stop.set()
+        input_q.put(None)
         _kill_all_bg()
         console.print("\n[dim]Останавливаю адаптер…[/]")
         adapter.terminate()
