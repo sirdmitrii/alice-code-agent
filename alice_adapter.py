@@ -575,8 +575,13 @@ def render_messages_to_prompt(
     if tools:
         parts.append(build_tool_instructions(tools))
 
+    # последние 3 результата инструментов оставляем целиком, старые длинные —
+    # сворачиваем (экономия контекста: большие read_file/grep не висят вечно)
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    keep_full = set(tool_idx[-3:])
+
     id_to_name: dict[str, str] = {}
-    for m in messages:
+    for i, m in enumerate(messages):
         role = m.get("role")
         if role == "system":
             continue
@@ -594,7 +599,10 @@ def render_messages_to_prompt(
         elif role == "tool":
             name = id_to_name.get(m.get("tool_call_id"), "")
             head = f"[Результат: {name}]" if name else "[Результат инструмента]"
-            parts.append(head + "\n" + _content_to_text(m.get("content")))
+            content = _content_to_text(m.get("content"))
+            if i not in keep_full and len(content) > 400:
+                content = f"<свёрнуто, {len(content)} символов — см. выше>"
+            parts.append(head + "\n" + content)
 
     parts.append("[Ассистент]")
     return "\n\n".join(parts)
