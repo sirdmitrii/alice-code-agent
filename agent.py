@@ -27,7 +27,7 @@ import queue as _queue
 
 import httpx
 from openai import OpenAI
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -74,6 +74,23 @@ def _default_ask(prompt_text: str) -> str:
 # main() подменяет его на чтение из очереди ответов (чтобы не конфликтовать с
 # фоновым приёмом ввода).
 ASK = _default_ask
+
+
+class _PTOutput:
+    """Файл для rich: его ANSI-вывод печатаем через prompt_toolkit (print_formatted_text
+    + ANSI). Так цвета сохраняются И вывод корректно ложится над строкой ввода под
+    patch_stdout (обычный путь rich печатал бы ANSI-коды буквально)."""
+
+    def write(self, data: str) -> int:
+        if data:
+            print_formatted_text(ANSI(data), end="")
+        return len(data or "")
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -860,7 +877,7 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
         if pending_att:
             extra["attachments"] = pending_att
             pending_att = None
-        console.print("[dim]Alice думает…[/]")
+        console.print("[dim cyan]⏳ Alice думает…[/]")
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
         )
@@ -882,7 +899,8 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
                 continue
             # финальный ответ
             if msg.content:
-                console.print(Panel(Markdown(msg.content), title="Alice", border_style="cyan"))
+                console.print(Panel(Markdown(msg.content), title="🤖 Alice",
+                                    border_style="cyan", title_align="left"))
             messages.append({"role": "assistant", "content": msg.content or ""})
             return modified
 
@@ -1223,6 +1241,9 @@ def main() -> None:
         if not stripped:
             return
 
+        # блок «мой ввод» (зелёный) — отделяет задачу от вывода Алисы, особенно
+        # когда задач в очереди несколько
+        console.print(f"\n[bold green]▶ ты:[/] {stripped[:300]}")
         sess_, messages_ = state["sess"], state["messages"]
         atts, cleaned = detect_attachments(line)
         if atts:
@@ -1264,10 +1285,11 @@ def main() -> None:
 
     wt = threading.Thread(target=worker, daemon=True)
     try:
-        # под patch_stdout rich-ANSI печатается буквально (мешанина), поэтому
-        # выключаем цвет — вывод монохромный, но чистый. Рамки/markdown остаются.
-        console = Console(color_system=None)
         with patch_stdout():
+            # rich пишет ANSI в _PTOutput -> prompt_toolkit интерпретирует цвета и
+            # печатает над строкой ввода (цвета сохраняются, без мешанины).
+            console = Console(file=_PTOutput(), force_terminal=True,
+                              width=shutil.get_terminal_size((100, 30)).columns)
             wt.start()
             while not stop.is_set():
                 try:
