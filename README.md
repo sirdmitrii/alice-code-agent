@@ -53,8 +53,14 @@
 ## Что умеет
 
 Инструменты: `read_file` (с номерами строк и диапазоном), `write_file`,
-`edit_file` (с `replace_all`), `list_dir`, `glob` (поиск файлов по маске),
-`grep` (поиск по содержимому), `run_command`.
+`edit_file` (с `replace_all`), `multi_edit` (несколько правок за раз),
+`list_dir`, `glob`, `grep`, `make_dir`/`move`/`copy`/`delete`, `apply_patch`,
+`run_command` (с таймаутом/подпапкой), `run_background`/`read_output`/`kill_process`
+(долгие процессы: серверы, watch), `git_status`/`git_diff`/`git_commit`,
+`web_fetch` (доки из сети), `update_todo` (план многошаговых задач).
+
+Правки показываются диффом; `/undo` откатывает последнюю правку. Для долгих
+задач агент ведёт план (TODO), который виден в консоли.
 
 **Память проекта:** если в рабочей папке есть `CLAUDE.md` / `AGENTS.md` / `.alice.md`,
 агент подхватит их в системный промпт.

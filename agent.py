@@ -7,14 +7,17 @@ agent.py — консольный кодовый агент (аналог Claude
 
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -118,8 +121,11 @@ def tool_read_file(path: str, start: Optional[int] = None,
 
 def tool_write_file(path: str, content: str) -> str:
     p = _safe_path(path)
+    before = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+    _checkpoint([path])
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
+    _show_diff(before, content, path)
     return f"Записано: {path} ({len(content)} символов)"
 
 
@@ -136,8 +142,10 @@ def tool_edit_file(path: str, old: str, new: str, replace_all: bool = False) -> 
     if n > 1 and not replace_all:
         return (f"Фрагмент `old` встречается {n} раз. Добавь контекста для уникальности "
                 "или передай replace_all=true, чтобы заменить все.")
-    text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-    p.write_text(text, encoding="utf-8")
+    new_text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    _checkpoint([path])
+    p.write_text(new_text, encoding="utf-8")
+    _show_diff(text, new_text, path)
     return f"Отредактировано: {path}" + (f" ({n} замен)" if replace_all and n > 1 else "")
 
 
@@ -149,19 +157,263 @@ def tool_list_dir(path: str = ".") -> str:
     return "\n".join(rows) or "(пусто)"
 
 
-def tool_run_command(command: str) -> str:
+def tool_run_command(command: str, timeout: int = 120, cwd: str = ".") -> str:
+    timeout = max(1, min(int(timeout or 120), 600))
+    workdir = _safe_path(cwd)
+    if not workdir.is_dir():
+        workdir = PROJECT_DIR
     try:
         r = subprocess.run(
-            command, shell=True, cwd=PROJECT_DIR,
-            capture_output=True, text=True, timeout=120, errors="replace",
+            command, shell=True, cwd=str(workdir),
+            capture_output=True, text=True, timeout=timeout, errors="replace",
         )
     except subprocess.TimeoutExpired:
-        return "Команда превысила таймаут 120с."
+        return (f"Команда превысила таймаут {timeout}с. Для долгих процессов "
+                "(серверы, watch) используй run_background.")
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     out = out.strip() or "(нет вывода)"
     if len(out) > 30000:
         out = out[:30000] + "\n... [обрезано]"
     return f"exit={r.returncode}\n{out}"
+
+
+# ---------------------------------------------------------------------------
+# Новые инструменты v0.5.0: правки, файловые операции, фоновые процессы, git, web
+# ---------------------------------------------------------------------------
+
+# Стек снапшотов для /undo: каждый элемент — список (путь, прежние_байты | None).
+_undo_stack: list = []
+
+
+def _checkpoint(paths: list) -> None:
+    snap = []
+    for rel in paths:
+        try:
+            ap = _safe_path(rel)
+        except ValueError:
+            continue
+        snap.append((str(ap), ap.read_bytes() if ap.exists() else None))
+    if snap:
+        _undo_stack.append(snap)
+        if len(_undo_stack) > 50:
+            _undo_stack.pop(0)
+
+
+def _show_diff(before: str, after: str, path: str) -> None:
+    if before == after:
+        return
+    diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(),
+                                     fromfile=f"{path} (было)", tofile=f"{path} (стало)",
+                                     lineterm="", n=2))
+    if not diff:
+        return
+    shown = diff[:60]
+    for line in shown:
+        color = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
+        console.print(f"[{color}]{line}[/]")
+    if len(diff) > 60:
+        console.print(f"[dim]… ещё {len(diff) - 60} строк диффа[/]")
+
+
+def tool_multi_edit(path: str, edits: list) -> str:
+    """Несколько правок в одном файле за вызов. edits: [{old, new, replace_all?}]."""
+    p = _safe_path(path)
+    if not p.exists():
+        return f"Файл не найден: {path}"
+    before = p.read_text(encoding="utf-8")
+    text = before
+    applied = 0
+    for i, ed in enumerate(edits or [], 1):
+        old, new = ed.get("old", ""), ed.get("new", "")
+        ra = bool(ed.get("replace_all"))
+        cnt = text.count(old)
+        if cnt == 0:
+            return f"Правка {i}: фрагмент `old` не найден. Применено до этого: {applied}."
+        if cnt > 1 and not ra:
+            return f"Правка {i}: фрагмент встречается {cnt} раз — уточни или replace_all=true."
+        text = text.replace(old, new) if ra else text.replace(old, new, 1)
+        applied += 1
+    _checkpoint([path])
+    p.write_text(text, encoding="utf-8")
+    _show_diff(before, text, path)
+    return f"Отредактировано: {path} ({applied} правок)"
+
+
+def tool_make_dir(path: str) -> str:
+    p = _safe_path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return f"Создана директория: {path}"
+
+
+def tool_move(src: str, dst: str) -> str:
+    s, d = _safe_path(src), _safe_path(dst)
+    if not s.exists():
+        return f"Не найдено: {src}"
+    _checkpoint([src, dst])
+    d.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(s), str(d))
+    return f"Перемещено: {src} -> {dst}"
+
+
+def tool_copy(src: str, dst: str) -> str:
+    s, d = _safe_path(src), _safe_path(dst)
+    if not s.exists():
+        return f"Не найдено: {src}"
+    _checkpoint([dst])
+    d.parent.mkdir(parents=True, exist_ok=True)
+    if s.is_dir():
+        shutil.copytree(str(s), str(d), dirs_exist_ok=True)
+    else:
+        shutil.copy2(str(s), str(d))
+    return f"Скопировано: {src} -> {dst}"
+
+
+def tool_delete(path: str) -> str:
+    p = _safe_path(path)
+    if not p.exists():
+        return f"Не найдено: {path}"
+    _checkpoint([path])
+    if p.is_dir():
+        shutil.rmtree(str(p))
+    else:
+        p.unlink()
+    return f"Удалено: {path}"
+
+
+def tool_apply_patch(patch: str) -> str:
+    """Применяет unified diff. Сначала пробует `git apply`, иначе — ошибка с
+    подсказкой использовать multi_edit."""
+    tmp = Path(tempfile.gettempdir()) / f"alice_patch_{uuid.uuid4().hex[:8]}.diff"
+    tmp.write_text(patch, encoding="utf-8")
+    try:
+        for args in (["git", "apply", "--whitespace=nowarn", str(tmp)],
+                     ["git", "apply", "-p0", "--whitespace=nowarn", str(tmp)]):
+            r = subprocess.run(args, cwd=str(PROJECT_DIR), capture_output=True,
+                               text=True, timeout=60, errors="replace")
+            if r.returncode == 0:
+                return "Патч применён (git apply)."
+        return ("Не удалось применить патч: " + (r.stderr or "").strip()[:500] +
+                "\nПопробуй edit_file/multi_edit вместо патча.")
+    except FileNotFoundError:
+        return "git не найден — применить патч нельзя. Используй edit_file/multi_edit."
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# --- фоновые процессы ---
+_bg_procs: dict = {}
+
+
+def _bg_reader(bid: str, proc: subprocess.Popen) -> None:
+    buf = _bg_procs[bid]["output"]
+    try:
+        for line in proc.stdout:  # type: ignore
+            buf.append(line)
+            if len(buf) > 2000:
+                del buf[:1000]
+    except Exception:
+        pass
+
+
+def tool_run_background(command: str, cwd: str = ".") -> str:
+    workdir = _safe_path(cwd)
+    if not workdir.is_dir():
+        workdir = PROJECT_DIR
+    bid = uuid.uuid4().hex[:6]
+    proc = subprocess.Popen(
+        command, shell=True, cwd=str(workdir), stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1)
+    _bg_procs[bid] = {"proc": proc, "output": [], "command": command}
+    t = threading.Thread(target=_bg_reader, args=(bid, proc), daemon=True)
+    t.start()
+    return (f"Запущен фоновый процесс id={bid}: {command}\n"
+            f"Вывод смотри через read_output(id={bid}), останови через kill_process.")
+
+
+def tool_read_output(id: str) -> str:
+    info = _bg_procs.get(id)
+    if not info:
+        return f"Нет фонового процесса id={id}."
+    rc = info["proc"].poll()
+    status = "завершён, exit=" + str(rc) if rc is not None else "выполняется"
+    out = "".join(info["output"])[-12000:] or "(пока нет вывода)"
+    return f"[{status}]\n{out}"
+
+
+def tool_kill_process(id: str) -> str:
+    info = _bg_procs.get(id)
+    if not info:
+        return f"Нет фонового процесса id={id}."
+    info["proc"].terminate()
+    return f"Процесс id={id} остановлен."
+
+
+def _kill_all_bg() -> None:
+    for info in _bg_procs.values():
+        try:
+            info["proc"].terminate()
+        except Exception:
+            pass
+
+
+# --- git ---
+def _git(args: list, timeout: int = 30) -> str:
+    try:
+        r = subprocess.run(["git", *args], cwd=str(PROJECT_DIR), capture_output=True,
+                           text=True, timeout=timeout, errors="replace")
+    except FileNotFoundError:
+        return "git не установлен."
+    out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+    return out.strip() or "(нет вывода)"
+
+
+def tool_git_status() -> str:
+    return _git(["status", "--short", "--branch"])
+
+
+def tool_git_diff(path: str = "") -> str:
+    args = ["diff"] + ([path] if path else [])
+    out = _git(args)
+    return out[:30000] + "\n... [обрезано]" if len(out) > 30000 else out
+
+
+def tool_git_commit(message: str) -> str:
+    _git(["add", "-A"])
+    return _git(["commit", "-m", message])
+
+
+# --- web ---
+def tool_web_fetch(url: str) -> str:
+    """Скачивает страницу и возвращает текст (теги вырезаны)."""
+    try:
+        r = httpx.get(url, timeout=30, follow_redirects=True,
+                      headers={"User-Agent": "Mozilla/5.0"})
+    except Exception as e:
+        return f"Ошибка запроса: {e}"
+    text = r.text
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    if len(text) > 20000:
+        text = text[:20000] + "\n... [обрезано]"
+    return f"[{r.status_code}] {url}\n{text}"
+
+
+# --- план / todo ---
+_todo: list = []  # элементы {"text", "done"}
+
+
+def tool_update_todo(items: list) -> str:
+    """Обновляет список задач (план). items: [{text, done}]. Печатает план."""
+    global _todo
+    _todo = [{"text": str(it.get("text", "")), "done": bool(it.get("done"))}
+             for it in (items or []) if it.get("text")]
+    if not _todo:
+        return "План очищен."
+    lines = [("[x] " if it["done"] else "[ ] ") + it["text"] for it in _todo]
+    console.print(Panel("\n".join(lines), title="[cyan]План[/]", border_style="cyan"))
+    return "План обновлён:\n" + "\n".join(lines)
 
 
 # Папки-шум, которые поиск пропускает
@@ -231,12 +483,28 @@ TOOLS_IMPL = {
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
+    "multi_edit": tool_multi_edit,
     "list_dir": tool_list_dir,
     "glob": tool_glob,
     "grep": tool_grep,
+    "make_dir": tool_make_dir,
+    "move": tool_move,
+    "copy": tool_copy,
+    "delete": tool_delete,
+    "apply_patch": tool_apply_patch,
     "run_command": tool_run_command,
+    "run_background": tool_run_background,
+    "read_output": tool_read_output,
+    "kill_process": tool_kill_process,
+    "git_status": tool_git_status,
+    "git_diff": tool_git_diff,
+    "git_commit": tool_git_commit,
+    "web_fetch": tool_web_fetch,
+    "update_todo": tool_update_todo,
 }
-DANGEROUS = {"write_file", "edit_file", "run_command"}  # требуют подтверждения
+# Требуют подтверждения (меняют файлы/репозиторий или выполняют код):
+DANGEROUS = {"write_file", "edit_file", "multi_edit", "make_dir", "move", "copy",
+             "delete", "apply_patch", "run_command", "run_background", "git_commit"}
 
 TOOLS_SCHEMA = [
     {"type": "function", "function": {
@@ -291,10 +559,86 @@ TOOLS_SCHEMA = [
                        "required": ["pattern"]}}},
     {"type": "function", "function": {
         "name": "run_command",
-        "description": "Выполнить команду в shell (Windows cmd) внутри рабочей папки.",
+        "description": "Выполнить команду в shell внутри рабочей папки (блокирующе). "
+                       "timeout — секунды (по умолч. 120, макс 600), cwd — подпапка.",
         "parameters": {"type": "object",
-                       "properties": {"command": {"type": "string"}},
+                       "properties": {"command": {"type": "string"},
+                                      "timeout": {"type": "integer"},
+                                      "cwd": {"type": "string"}},
                        "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "multi_edit",
+        "description": "Несколько правок одного файла за вызов. edits — список "
+                       "объектов {old, new, replace_all?}, применяются по порядку.",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string"},
+                                      "edits": {"type": "array", "items": {"type": "object",
+                                          "properties": {"old": {"type": "string"},
+                                                         "new": {"type": "string"},
+                                                         "replace_all": {"type": "boolean"}}}}},
+                       "required": ["path", "edits"]}}},
+    {"type": "function", "function": {
+        "name": "make_dir", "description": "Создать директорию (с родителями).",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                       "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "move", "description": "Переместить/переименовать файл или папку.",
+        "parameters": {"type": "object",
+                       "properties": {"src": {"type": "string"}, "dst": {"type": "string"}},
+                       "required": ["src", "dst"]}}},
+    {"type": "function", "function": {
+        "name": "copy", "description": "Скопировать файл или папку.",
+        "parameters": {"type": "object",
+                       "properties": {"src": {"type": "string"}, "dst": {"type": "string"}},
+                       "required": ["src", "dst"]}}},
+    {"type": "function", "function": {
+        "name": "delete", "description": "Удалить файл или папку (рекурсивно).",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                       "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "apply_patch",
+        "description": "Применить unified diff (git-патч) к файлам рабочей папки.",
+        "parameters": {"type": "object", "properties": {"patch": {"type": "string"}},
+                       "required": ["patch"]}}},
+    {"type": "function", "function": {
+        "name": "run_background",
+        "description": "Запустить долгий процесс в фоне (dev-сервер, watch). Вернёт id; "
+                       "вывод — read_output(id), остановка — kill_process(id).",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}},
+                       "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_output", "description": "Прочитать накопленный вывод фонового процесса.",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}},
+                       "required": ["id"]}}},
+    {"type": "function", "function": {
+        "name": "kill_process", "description": "Остановить фоновый процесс по id.",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}},
+                       "required": ["id"]}}},
+    {"type": "function", "function": {
+        "name": "git_status", "description": "git status (короткий) рабочей папки.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "git_diff", "description": "git diff (опц. по пути).",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "git_commit", "description": "git add -A и git commit с сообщением.",
+        "parameters": {"type": "object", "properties": {"message": {"type": "string"}},
+                       "required": ["message"]}}},
+    {"type": "function", "function": {
+        "name": "web_fetch",
+        "description": "Скачать веб-страницу и вернуть её текст (без тегов).",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}},
+                       "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "update_todo",
+        "description": "Обновить план задач (TODO). Используй для многошаговых задач: "
+                       "items — список {text, done}. Отмечай выполненные.",
+        "parameters": {"type": "object",
+                       "properties": {"items": {"type": "array", "items": {"type": "object",
+                           "properties": {"text": {"type": "string"},
+                                          "done": {"type": "boolean"}}}}},
+                       "required": ["items"]}}},
 ]
 
 SYSTEM_PROMPT = (
@@ -304,8 +648,13 @@ SYSTEM_PROMPT = (
     "файлов по маске, grep — поиск по содержимому, read_file), затем вноси "
     "небольшие правки (write_file, edit_file) и при необходимости "
     "запускай команды (run_command), проверяя результат. Никогда не выдумывай "
-    "содержимое файлов — читай их. Когда задача выполнена, дай краткий итог "
-    "обычным текстом, не вызывая инструменты."
+    "содержимое файлов — читай их.\n"
+    "Для многошаговых задач сначала составь план через update_todo и по ходу "
+    "отмечай выполненные пункты. Несколько правок одного файла делай за один "
+    "multi_edit. Долгие процессы (серверы, watch) запускай через run_background и "
+    "смотри вывод через read_output. Доступны файловые операции (make_dir, move, "
+    "copy, delete), git (git_status/git_diff/git_commit) и web_fetch для доков.\n"
+    "Когда задача выполнена, дай краткий итог обычным текстом, не вызывая инструменты."
 )
 
 
@@ -799,14 +1148,29 @@ def main() -> None:
                 messages = sess["messages"]
                 console.print(f"[dim]Новая сессия {sess['id']} (контекст очищен).[/]")
                 continue
+            if cmd == "/undo":
+                if not _undo_stack:
+                    console.print("[dim]Нечего откатывать.[/]")
+                    continue
+                snap = _undo_stack.pop()
+                for path_str, prev in snap:
+                    pp = Path(path_str)
+                    if prev is None:
+                        if pp.exists():
+                            pp.unlink()
+                    else:
+                        pp.parent.mkdir(parents=True, exist_ok=True)
+                        pp.write_bytes(prev)
+                console.print(f"[green]Откат выполнен ({len(snap)} файлов).[/]")
+                continue
             if cmd == "/help":
                 console.print(
                     "[dim]Опиши задачу обычным текстом. Многострочная вставка (Ctrl+V) "
                     "и история (↑/↓) поддерживаются.\n"
                     "Прикрепить файл: Ctrl+V путь к файлу (скопируй файл в Проводнике) "
                     "или скриншот из буфера — Алиса его прочитает.\n"
-                    "/resume [id] — вернуться к прошлой сессии · /clear — новая сессия · "
-                    "/trust — уровень доверия (подтверждения) · /exit — выход.[/]")
+                    "/resume [id] — прошлая сессия · /clear — новая · /undo — откатить "
+                    "последнюю правку · /trust — подтверждения · /exit — выход.[/]")
                 continue
             if cmd == "/trust" or cmd.startswith("/trust "):
                 arg = stripped[len("/trust"):].strip().lower()
@@ -860,6 +1224,7 @@ def main() -> None:
                 console.print(f"[red]Ошибка запроса: {e}[/]")
             save_session(sess)
     finally:
+        _kill_all_bg()
         console.print("\n[dim]Останавливаю адаптер…[/]")
         adapter.terminate()
         try:
