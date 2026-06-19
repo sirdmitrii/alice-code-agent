@@ -101,8 +101,22 @@ def _load() -> Optional[Creds]:
         return None
     try:
         data = json.loads(CREDS_FILE.read_text(encoding="utf-8"))
-        return Creds(**data)
-    except Exception:
+    except Exception as e:
+        print(f"[alice_session] не прочитать {CREDS_FILE.name}: {e}", file=sys.stderr)
+        return None
+    fields = getattr(Creds, "__dataclass_fields__", {})
+    known = {k: v for k, v in data.items() if k in fields}
+    missing = [k for k in fields if k not in known]
+    if missing:
+        # схема кред поменялась (старый/новый формат файла) — не молчим, чтобы
+        # «постоянно требует логин» не выглядело загадкой
+        print(f"[alice_session] {CREDS_FILE.name}: нет полей {missing} — нужен повторный вход",
+              file=sys.stderr)
+        return None
+    try:
+        return Creds(**known)
+    except Exception as e:
+        print(f"[alice_session] неверные креды в {CREDS_FILE.name}: {e}", file=sys.stderr)
         return None
 
 

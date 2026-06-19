@@ -214,9 +214,16 @@ class AliceClient:
 
     async def _pump(self, ws, want: str) -> dict[str, Any]:
         """Читает кадры (отвечая Pong на серверный Ping), пока в payload директивы
-        не появится ключ `want`; возвращает этот payload."""
+        не появится ключ `want`; возвращает этот payload. Есть ОБЩИЙ дедлайн: иначе
+        периодические Ping сбрасывали бы per-recv таймаут и цикл висел бы вечно."""
+        deadline = time.monotonic() + REQUEST_TIMEOUT
         while True:
-            raw = await asyncio.wait_for(ws.recv(), timeout=REQUEST_TIMEOUT)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Алиса не прислала «{want}» за {REQUEST_TIMEOUT:.0f}с.")
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             if isinstance(raw, (bytes, bytearray)):
                 continue
             try:
@@ -312,15 +319,23 @@ class AliceClient:
         creds = await alice_session.get_credentials()
         try:
             return await self._roundtrip(creds, prompt, dialog_id, attachments)
-        except HTTPException:
-            # Возможно протухли токен/кука — тихо (headless) обновляем и повторяем.
+        except HTTPException as first:
+            # Возможно протухли токен/кука — тихо (headless) обновляем и повторяем
+            # один раз. Если обновлённая сессия не залогинена (нужен интерактивный
+            # вход) — не маскируем исходную ошибку, а подсказываем /login.
             try:
                 creds = await alice_session.refresh(interactive_ok=False)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Сессия Алисы недействительна и не обновилась "
-                           f"автоматически: {e}. Перезапусти и залогинься заново.")
+                    detail=f"Сессия Алисы недействительна и не обновилась автоматически: "
+                           f"{e}. Выполни /login (повторный вход). Исходная ошибка: "
+                           f"{first.detail}")
+            if not getattr(creds, "logged_in", False):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Сессия слетела в Base и не восстановилась без браузера. "
+                           f"Выполни /login. Исходная ошибка: {first.detail}")
             return await self._roundtrip(creds, prompt, dialog_id, attachments)
 
     async def _read_response(self, ws) -> str:
@@ -397,8 +412,12 @@ FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 
 # Блок «тела» аргумента: строка @@ключ@@ ... строка @@end@@ (или конец текста).
 # Тело берётся дословно — без экранирования и без конфликта с ```.
+# Если модель забыла @@end@@, тело НЕ должно «съесть» следующий вызов: помимо
+# @@end@@ и конца текста, останавливаемся перед началом нового блока @@ключ@@ и
+# перед фенсом ```tool_call (его тело почти никогда не содержит дословно).
 BODY_RE = re.compile(
-    r"^@@(?!end@@)([A-Za-z_]\w*)@@[ \t]*\r?\n(.*?)(?:^@@end@@[ \t]*\r?$|\Z)",
+    r"^@@(?!end@@)([A-Za-z_]\w*)@@[ \t]*\r?\n(.*?)"
+    r"(?:^@@end@@[ \t]*\r?$|(?=^@@[A-Za-z_]\w*@@[ \t]*\r?$)|(?=^```tool_call)|\Z)",
     re.DOTALL | re.MULTILINE)
 
 # Плейсхолдер тела внутри JSON: значение аргумента вида "@@ключ@@".
@@ -426,6 +445,33 @@ def _loads_tolerant(s: str) -> Any:
             return json.loads(candidate)
         except json.JSONDecodeError:
             continue
+    return None
+
+
+def _balanced_json(text: str, i: int) -> Optional[str]:
+    """От позиции '{' возвращает подстроку сбалансированного JSON-объекта (с учётом
+    строк и экранирования) либо None. Нужно, когда внутри JSON есть ``` и фенс
+    обрывается раньше закрывающей скобки."""
+    if i < 0 or i >= len(text) or text[i] != "{":
+        return None
+    depth, in_str, esc = 0, False, False
+    for j in range(i, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
     return None
 
 
@@ -528,6 +574,8 @@ def build_tool_instructions(tools: list[dict[str, Any]]) -> str:
         "def foo(): return 42",
         "@@end@@",
         "",
+        "Если вызовов несколько — тело каждого ставь СРАЗУ после ЕГО блока вызова и",
+        "обязательно закрывай @@end@@ (порядок тел должен совпадать с порядком вызовов).",
         "Простые инструменты (read_file, list_dir, glob, grep, run_command) вызывай",
         "обычным JSON без тел. Если инструмент не нужен — отвечай обычным текстом.",
         "Доступные инструменты:",
@@ -622,12 +670,20 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     call_spans: list[tuple[int, int]] = []
     for m in FENCE_RE.finditer(text):
         obj = _loads_tolerant(m.group(1))
+        span_end = m.end()
+        if obj is None:
+            # фенс мог оборваться на ``` внутри JSON-строки — добираем по скобкам
+            brace = text.find("{", m.start())
+            js = _balanced_json(text, brace) if brace != -1 else None
+            if js:
+                obj = _loads_tolerant(js)
+                span_end = max(m.end(), brace + len(js))
         candidates = obj if isinstance(obj, list) else [obj]
         matched = [c for c in candidates if _looks_like_call(c)]
         if matched:
             for c in matched:
                 tool_calls.append(_mk_call(_resolve_bodies(c, bodies)))
-            call_spans.append(m.span())
+            call_spans.append((m.start(), span_end))
 
     if tool_calls:
         return _strip_spans(text, call_spans + body_spans), tool_calls

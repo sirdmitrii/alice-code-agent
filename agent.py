@@ -129,10 +129,36 @@ class _PTOutput:
 _status = {"busy": False, "asking": False, "text": "Alice думает"}
 
 
+def _force_prompt_redraw() -> None:
+    """Принудительно перерисовать приглашение (из любого потока). Нужно на
+    переходе «занят→свободен»: тикер в этот момент уже не тикает, и строка
+    спиннера осталась бы на экране до следующей клавиши."""
+    sess = _input_session
+    if sess is None:
+        return
+    try:
+        app = sess.app
+        loop = getattr(app, "loop", None)
+        if getattr(app, "is_running", False) and loop is not None:
+            loop.call_soon_threadsafe(app._redraw)
+    except Exception:
+        pass
+
+
 def set_thinking(on: bool, text: str = "Alice думает") -> None:
     _status["busy"] = on
     if on:
         _status["text"] = text
+    else:
+        _force_prompt_redraw()  # убрать строку спиннера сразу, не дожидаясь клавиши
+
+
+def _looks_like_answer(line: str) -> bool:
+    """Похоже на ответ y/n/a (а не на новую задачу), чтобы во время подтверждения
+    случайно не съесть набранную задачу как ответ."""
+    a = line.strip().lower()
+    return (a == "" or len(a) <= 4
+            or a in ("yes", "no", "да", "нет", "ага", "ok", "ок", "всегда", "always"))
 
 
 # Вращающийся бегунок из ASCII: кадры заведомо различимы в любом консольном шрифте
@@ -194,6 +220,16 @@ def _safe_path(rel: str) -> Path:
     return p
 
 
+def _safe_workdir(cwd: str) -> Path:
+    """Рабочая папка для команд: внутри проекта и существующая, иначе PROJECT_DIR
+    (не кидает ValueError на путь вне проекта — мягкий фолбэк)."""
+    try:
+        wd = _safe_path(cwd)
+    except ValueError:
+        return PROJECT_DIR
+    return wd if wd.is_dir() else PROJECT_DIR
+
+
 def tool_read_file(path: str, start: Optional[int] = None,
                    end: Optional[int] = None) -> str:
     p = _safe_path(path)
@@ -228,7 +264,14 @@ def tool_edit_file(path: str, old: str, new: str, replace_all: bool = False) -> 
     p = _safe_path(path)
     if not p.exists():
         return f"Файл не найден: {path}"
-    text = p.read_text(encoding="utf-8")
+    if not old:
+        return ("Параметр `old` не может быть пустым: укажи фрагмент для замены "
+                "(для создания/перезаписи файла используй write_file).")
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return (f"Файл {path} не в кодировке UTF-8 — правка текстом невозможна "
+                "(вероятно бинарный или cp1251). Используй другой подход.")
     n = text.count(old)
     if n == 0:
         return ("Фрагмент `old` не найден — нужно точное совпадение, включая отступы. "
@@ -254,9 +297,7 @@ def tool_list_dir(path: str = ".") -> str:
 
 def tool_run_command(command: str, timeout: int = 120, cwd: str = ".") -> str:
     timeout = max(1, min(int(timeout or 120), 600))
-    workdir = _safe_path(cwd)
-    if not workdir.is_dir():
-        workdir = PROJECT_DIR
+    workdir = _safe_workdir(cwd)
     try:
         r = subprocess.run(
             command, shell=True, cwd=str(workdir),
@@ -292,7 +333,9 @@ def _checkpoint(paths: list) -> None:
             ap = _safe_path(rel)
         except ValueError:
             continue
-        snap.append((str(ap), ap.read_bytes() if ap.exists() else None))
+        # снапшотим только файлы; директории read_bytes() ронял (IsADirectory/
+        # PermissionError) и ломал move/delete/copy папок
+        snap.append((str(ap), ap.read_bytes() if (ap.exists() and ap.is_file()) else None))
     if snap:
         _undo_stack.append(snap)
         if len(_undo_stack) > 50:
@@ -320,12 +363,18 @@ def tool_multi_edit(path: str, edits: list) -> str:
     p = _safe_path(path)
     if not p.exists():
         return f"Файл не найден: {path}"
-    before = p.read_text(encoding="utf-8")
+    try:
+        before = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return (f"Файл {path} не в кодировке UTF-8 — правка текстом невозможна "
+                "(вероятно бинарный или cp1251).")
     text = before
     applied = 0
     for i, ed in enumerate(edits or [], 1):
         old, new = ed.get("old", ""), ed.get("new", "")
         ra = bool(ed.get("replace_all"))
+        if not old:
+            return f"Правка {i}: параметр `old` пустой — так нельзя. Применено до этого: {applied}."
         cnt = text.count(old)
         if cnt == 0:
             return f"Правка {i}: фрагмент `old` не найден. Применено до этого: {applied}."
@@ -385,6 +434,14 @@ def tool_apply_patch(patch: str) -> str:
     подсказкой использовать multi_edit."""
     tmp = Path(tempfile.gettempdir()) / f"alice_patch_{uuid.uuid4().hex[:8]}.diff"
     tmp.write_text(patch, encoding="utf-8")
+    # снапшот целевых файлов (из заголовков +++/---), чтобы /undo мог откатить патч
+    targets = []
+    for m in re.finditer(r"(?m)^(?:\+\+\+|---)\s+(?:[ab]/)?(\S+)", patch):
+        f = m.group(1)
+        if f and f != "/dev/null" and f not in targets:
+            targets.append(f)
+    if targets:
+        _checkpoint(targets)
     try:
         for args in (["git", "apply", "--whitespace=nowarn", str(tmp)],
                      ["git", "apply", "-p0", "--whitespace=nowarn", str(tmp)]):
@@ -416,9 +473,7 @@ def _bg_reader(bid: str, proc: subprocess.Popen) -> None:
 
 
 def tool_run_background(command: str, cwd: str = ".") -> str:
-    workdir = _safe_path(cwd)
-    if not workdir.is_dir():
-        workdir = PROJECT_DIR
+    workdir = _safe_workdir(cwd)
     bid = uuid.uuid4().hex[:6]
     proc = subprocess.Popen(
         command, shell=True, cwd=str(workdir), stdout=subprocess.PIPE,
@@ -426,9 +481,14 @@ def tool_run_background(command: str, cwd: str = ".") -> str:
     _bg_procs[bid] = {"proc": proc, "output": [], "command": command}
     t = threading.Thread(target=_bg_reader, args=(bid, proc), daemon=True)
     t.start()
-    # короткая пауза: не упал ли процесс сразу (нет модуля, синтаксис, краш на старте)
-    time.sleep(1.5)
-    rc = proc.poll()
+    # проверяем ~1.5с, не упал ли процесс сразу (нет модуля, синтаксис, краш на
+    # старте), но выходим как только он явно жив — не блокируем очередь зря
+    rc = None
+    for _ in range(15):
+        rc = proc.poll()
+        if rc is not None:
+            break
+        time.sleep(0.1)
     if rc is not None:
         out = "".join(_bg_procs[bid]["output"])[-4000:].strip() or "(нет вывода)"
         return (f"Процесс id={bid} завершился СРАЗУ с кодом {rc} — окно не открылось/не "
@@ -449,18 +509,35 @@ def tool_read_output(id: str) -> str:
     return f"[{status}]\n{out}"
 
 
+def _reap(proc: subprocess.Popen) -> None:
+    """Завершить процесс и закрыть его пайп (без утечки дескрипторов/зомби)."""
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+    except Exception:
+        pass
+
+
 def tool_kill_process(id: str) -> str:
     info = _bg_procs.get(id)
     if not info:
         return f"Нет фонового процесса id={id}."
-    info["proc"].terminate()
+    _reap(info["proc"])
     return f"Процесс id={id} остановлен."
 
 
 def _kill_all_bg() -> None:
     for info in _bg_procs.values():
         try:
-            info["proc"].terminate()
+            _reap(info["proc"])
         except Exception:
             pass
 
@@ -614,6 +691,16 @@ TOOLS_IMPL = {
 # Требуют подтверждения (меняют файлы/репозиторий или выполняют код):
 DANGEROUS = {"write_file", "edit_file", "multi_edit", "make_dir", "move", "copy",
              "delete", "apply_patch", "run_command", "run_background", "git_commit"}
+
+# Инструменты, меняющие файлы → префикс успешного результата. Нужно, чтобы флаг
+# modified (и ALICE_VERIFY_CMD после хода) срабатывал на ВСЕ правки, не только
+# write_file/edit_file.
+_MUTATOR_OK = {
+    "write_file": ("Записано",), "edit_file": ("Отредактировано",),
+    "multi_edit": ("Отредактировано",), "move": ("Перемещено",),
+    "copy": ("Скопировано",), "delete": ("Удалено",),
+    "apply_patch": ("Патч применён",),
+}
 
 TOOLS_SCHEMA = [
     {"type": "function", "function": {
@@ -870,10 +957,30 @@ def detect_attachments(text: str) -> tuple[list, str]:
 
 def start_adapter() -> subprocess.Popen:
     log = open(ROOT / "adapter.log", "w", encoding="utf-8")
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, str(ROOT / "alice_adapter.py")],
         cwd=ROOT, stdout=log, stderr=log, env=os.environ.copy(),
     )
+    proc._alice_log = log  # type: ignore[attr-defined]  # чтобы закрыть при остановке
+    return proc
+
+
+def stop_adapter(proc: subprocess.Popen) -> None:
+    """Остановить адаптер и закрыть его лог-файл (без утечки дескриптора)."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    log = getattr(proc, "_alice_log", None)
+    if log is not None:
+        try:
+            log.close()
+        except Exception:
+            pass
 
 
 def wait_health(timeout: float = 25.0) -> bool:
@@ -927,13 +1034,16 @@ def confirm_batch(calls: list) -> str:
              for tc in calls]
     title = "Выполнить операцию?" if len(calls) == 1 else f"Выполнить {len(calls)} операции?"
     console.print(Panel("\n".join(lines), title=f"[yellow]{title}[/]", border_style="yellow"))
-    ans = ASK("[yellow](y)[/] да   [yellow](n)[/] нет   [yellow](a)[/] больше не спрашивать: ")
-    first = (ans.strip().lower()[:1] or "y")
-    if first in ("n", "н"):
-        return "no"
-    if first in ("a", "а"):   # латинская a и кириллическая а
+    ans = ASK("[yellow](y)[/] да   [yellow](n)[/] нет   [yellow](a)[/] всегда   "
+              "[dim](Enter — нет)[/]: ").strip().lower()
+    first = ans[:1]
+    # fail-safe: подтверждаем ТОЛЬКО на явное «да»; пустой ответ/отмена/непонятное
+    # → «нет» (раньше любое не-n/a трактовалось как «да» — опасно при отмене/закрытии)
+    if first in ("a", "а"):                       # латинская a и кириллическая а
         return "always"
-    return "yes"
+    if first in ("y", "д") or ans in ("yes", "да", "ага", "ok", "ок"):
+        return "yes"
+    return "no"
 
 
 # ---------------------------------------------------------------------------
@@ -947,9 +1057,11 @@ _BROKEN_CALL_RE = re.compile(r"(?m)^@@(?:end|[A-Za-z_]\w*)@@\s*$")
 # «[Ассистент вызвал] read_file(...)», «Вызываю read_file(...)» и т.п.
 _NARRATED_CALL_RE = re.compile(
     r"\[\s*(?:ассистент|assistant)[^\]]*?(?:вы[зч]|call)", re.IGNORECASE)
-# Строка вида «toolname(...)» в начале строки, где toolname — настоящий инструмент.
+# Строка, которая ЦЕЛИКОМ выглядит как голый вызов «toolname(...)» (и ничего
+# больше) — признак «рассказанного» вызова. Требуем закрывающую скобку в конце
+# строки, чтобы не ловить обычную прозу вроде «read_file(path) читает файл».
 _TOOLCALL_LINE_RE = re.compile(
-    r"(?m)^\s*(?:" + "|".join(re.escape(k) for k in TOOLS_IMPL) + r")\s*\(")
+    r"(?m)^\s*(?:" + "|".join(re.escape(k) for k in TOOLS_IMPL) + r")\s*\([^\n]*\)\s*$")
 
 
 def _looks_like_broken_call(text: str) -> bool:
@@ -994,21 +1106,26 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
     pending_att = attachments  # вложения шлём только на первом вызове хода
     modified = False  # были ли write_file/edit_file
     for _ in range(25):  # предохранитель от бесконечного цикла
-        trim_history(messages)  # быстрая страховка от переполнения внутри хода
+        trim_history(messages)       # страховка от переполнения внутри хода
+        _repair_tool_pairs(messages)  # гарантируем валидную парность перед запросом
         extra: dict = {"dialog_id": dialog_id} if dialog_id else {}
         if pending_att:
             extra["attachments"] = pending_att
-            pending_att = None
         set_thinking(True, "Alice думает")
         resp = _create_with_retry(
             client, model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
         )
         msg = resp.choices[0].message
 
+        # «битый» вызов (рассказан текстом / сломан формат)? попросим повторить
+        broken = bool(not msg.tool_calls and msg.content and repairs_left > 0
+                      and _looks_like_broken_call(msg.content))
+        if not broken:
+            pending_att = None  # ответ принят — вложения больше не досылаем
+
         # ответ без инструментов
         if not msg.tool_calls:
-            # битый вызов? просим повторить, а не завершаем молча
-            if msg.content and repairs_left > 0 and _looks_like_broken_call(msg.content):
+            if broken:
                 repairs_left -= 1
                 console.print("[yellow]Вызов инструмента сломан — прошу Алису повторить…[/]")
                 messages.append({"role": "assistant", "content": msg.content})
@@ -1067,8 +1184,8 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
                 except Exception as e:
                     result = f"Ошибка инструмента: {e}"
 
-            if name in ("write_file", "edit_file") and result.startswith(
-                    ("Записано", "Отредактировано")):
+            ok_prefix = _MUTATOR_OK.get(name)
+            if ok_prefix and result.startswith(ok_prefix):
                 modified = True
             preview = result.replace("\n", " ")
             console.print(f"[dim]  ↳ {preview[:200]}{'…' if len(result) > 200 else ''}[/]")
@@ -1121,6 +1238,39 @@ def trim_history(messages: list, max_chars: int = 60000) -> None:
         if victim is None:
             break
         del messages[victim]
+    _repair_tool_pairs(messages)
+
+
+def _repair_tool_pairs(messages: list) -> None:
+    """Чинит парность assistant.tool_calls ↔ tool, чтобы API не отверг список
+    (400 'tool must follow tool_calls'). Удаление сообщений в trim/compact могло
+    оставить осиротевший tool или tool_calls без ответов — нормализуем оба случая."""
+    declared = set()  # id вызовов, объявленных в assistant.tool_calls
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                declared.add(tc.get("id"))
+    answered = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+    out = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            if m.get("tool_call_id") in declared:   # есть «родитель» — оставляем
+                out.append(m)
+            # иначе осиротевший результат — выкидываем
+        elif role == "assistant" and m.get("tool_calls"):
+            kept = [tc for tc in m["tool_calls"] if tc.get("id") in answered]
+            if kept:
+                nm = dict(m)
+                nm["tool_calls"] = kept
+                out.append(nm)
+            elif (m.get("content") or "").strip():
+                out.append({"role": "assistant", "content": m["content"]})
+            # пустой assistant без ответов на вызовы — пропускаем
+        else:
+            out.append(m)
+    if len(out) != len(messages):
+        messages[:] = out
 
 
 def _msg_brief(m: dict) -> str:
@@ -1143,7 +1293,12 @@ def compact_history(client: OpenAI, messages: list, max_chars: int = 60000) -> N
     if len(messages) <= keep + 2:
         trim_history(messages, max_chars)
         return
-    system, old, recent = messages[0], messages[1:-keep], messages[-keep:]
+    # не начинаем «хвост» с tool-сообщения и не разрываем группу tool_calls↔tool:
+    # сдвигаем границу назад, пока recent[0] — это tool (его assistant ушёл бы в old)
+    cut = len(messages) - keep
+    while cut > 1 and messages[cut].get("role") == "tool":
+        cut -= 1
+    system, old, recent = messages[0], messages[1:cut], messages[cut:]
     rendered = "\n".join(_msg_brief(m) for m in old)[:30000]
     try:
         console.print("[dim]Сжимаю историю…[/]")
@@ -1161,6 +1316,7 @@ def compact_history(client: OpenAI, messages: list, max_chars: int = 60000) -> N
         return
     messages[:] = ([system, {"role": "system",
                              "content": "[Сводка предыдущих шагов]\n" + summary}] + recent)
+    _repair_tool_pairs(messages)
     console.print("[dim]Контекст сжат в сводку.[/]")
 
 
@@ -1305,7 +1461,7 @@ def main() -> None:
     adapter = start_adapter()
     if not wait_health():
         console.print("[red]Адаптер не поднялся за 25с. Смотри adapter.log.[/]")
-        adapter.terminate()
+        stop_adapter(adapter)
         return
     console.print("[green]Готово, можно работать.[/]\n")
 
@@ -1329,19 +1485,22 @@ def main() -> None:
     state = {"sess": sess, "messages": messages}  # владелец — обработчик
 
     def ask_via_queue(prompt_text: str) -> str:
-        console.print(prompt_text)
+        # флаг ставим ДО печати приглашения — иначе строка, набранная сразу после
+        # появления вопроса, могла уйти как задача, а не как ответ (TOCTOU)
         confirm_mode.set()
         _status["asking"] = True  # prompt покажет «ждёт ответа», не спиннер
+        console.print(prompt_text)
         try:
             while not stop.is_set():
                 try:
                     return answer_q.get(timeout=0.3)
                 except _queue.Empty:
                     continue
-            return ""
+            return ""  # выключение во время ожидания → confirm_batch трактует как «нет»
         finally:
             confirm_mode.clear()
             _status["asking"] = False
+            _force_prompt_redraw()
 
     ASK = ask_via_queue
 
@@ -1350,6 +1509,16 @@ def main() -> None:
         очереди задач. Возвращает True, если строка была командой."""
         stripped = line.strip()
         cmd = stripped.lower()
+        base = cmd.split(" ", 1)[0]
+        # команды, меняющие состояние/блокирующие, нельзя выполнять посреди активной
+        # задачи или ожидания подтверждения — иначе гонки за state/_undo_stack,
+        # перезапуск адаптера под запросом и дедлоки на вложенных промптах
+        if base in ("/clear", "/resume", "/undo", "/login") and (
+                _status["busy"] or _status["asking"] or confirm_mode.is_set()):
+            console.print("[yellow]⏳ Агент сейчас занят — команда "
+                          f"{base} будет доступна, когда он освободится. "
+                          "Дождись завершения текущей задачи и повтори.[/]")
+            return True
         if cmd == "/queue":
             n = input_q.qsize()
             console.print(f"[dim]В очереди: {n}[/]" if n else "[dim]Очередь пуста.[/]")
@@ -1423,14 +1592,7 @@ def main() -> None:
         else:
             console.print("[yellow]Окно закрыто без входа — остаюсь в Base. "
                           "Перезапускаю адаптер…[/]")
-        try:
-            adapter.terminate()
-            adapter.wait(timeout=5)
-        except Exception:
-            try:
-                adapter.kill()
-            except Exception:
-                pass
+        stop_adapter(adapter)
         adapter = start_adapter()
         if wait_health():
             console.print("[green]Адаптер перезапущен с новой сессией.[/]")
@@ -1519,9 +1681,15 @@ def main() -> None:
                 s = line.strip().lower()
                 if s in ("/exit", "/quit", "exit", "quit"):
                     break
-                # пока агент ждёт подтверждения/выбора — это ответ ему
+                # пока агент ждёт подтверждения/выбора — короткий ввод это ответ;
+                # длинную строку считаем новой задачей (ставим в очередь, не теряем,
+                # и не трактуем как «да»)
                 if confirm_mode.is_set():
-                    answer_q.put(line)
+                    if _looks_like_answer(line):
+                        answer_q.put(line)
+                    else:
+                        input_q.put(line)
+                        console.print("[dim](поставил в очередь; ответь на подтверждение выше — y/n)[/]")
                     continue
                 # команды обрабатываем сразу, не кладя в очередь задач
                 if s.startswith("/") and do_command(line):
@@ -1537,11 +1705,7 @@ def main() -> None:
         input_q.put(None)
         _kill_all_bg()
         console.print("\n[dim]Останавливаю адаптер…[/]")
-        adapter.terminate()
-        try:
-            adapter.wait(timeout=5)
-        except Exception:
-            adapter.kill()
+        stop_adapter(adapter)
 
 
 if __name__ == "__main__":
