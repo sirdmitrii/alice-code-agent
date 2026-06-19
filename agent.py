@@ -26,10 +26,12 @@ from typing import Optional
 import queue as _queue
 
 import httpx
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APITimeoutError
 from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
@@ -56,13 +58,42 @@ ROOT = Path(__file__).resolve().parent
 # окружений), а нужна она только в момент реального ввода.
 _input_session: Optional[PromptSession] = None
 
+# Команды чата: имя → описание (для подсказок при вводе «/»).
+_COMMANDS: list[tuple[str, str]] = [
+    ("/help", "помощь по командам"),
+    ("/clear", "новая сессия (очистить контекст)"),
+    ("/resume", "вернуться к прошлой сессии"),
+    ("/undo", "откатить последнюю правку файлов"),
+    ("/trust", "уровень подтверждений: all / danger / none"),
+    ("/login", "повторный вход в Яндекс (окно браузера)"),
+    ("/queue", "показать очередь запросов"),
+    ("/exit", "выход"),
+]
+
+
+class _SlashCompleter(Completer):
+    """Выпадающие подсказки команд, когда строка начинается с «/» (как в
+    claude code). Срабатывает только пока вводится сама команда (до пробела)."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for name, desc in _COMMANDS:
+            if name.startswith(text):
+                yield Completion(name, start_position=-len(text),
+                                 display=name, display_meta=desc)
+
 
 def read_user_input() -> str:
     """Прочитать ввод пользователя. Поддерживает многострочную вставку."""
     global _input_session
     if _input_session is None:
-        _input_session = PromptSession(history=InMemoryHistory())
-    return _input_session.prompt(ANSI("\x1b[1;32m› \x1b[0m"))
+        _input_session = PromptSession(history=InMemoryHistory(),
+                                       refresh_interval=0.2,
+                                       completer=_SlashCompleter(),
+                                       complete_while_typing=True)
+    return _input_session.prompt(_prompt_message)
 
 
 def _default_ask(prompt_text: str) -> str:
@@ -91,6 +122,40 @@ class _PTOutput:
 
     def isatty(self) -> bool:
         return True
+
+
+# Анимированный статус «Alice думает…» над строкой ввода. Кадр спиннера
+# вычисляется по времени, а поток-тикер форсит перерисовку приглашения.
+_status = {"busy": False, "asking": False, "text": "Alice думает"}
+
+
+def set_thinking(on: bool, text: str = "Alice думает") -> None:
+    _status["busy"] = on
+    if on:
+        _status["text"] = text
+
+
+# Вращающийся бегунок из ASCII: кадры заведомо различимы в любом консольном шрифте
+# (брайлевые точки ⠋⠙⠹… у многих выглядят одинаково и кажутся застывшими).
+_SPINNER = "|/-\\"
+
+
+def _prompt_message():
+    """Текст приглашения. Пока агент занят — над строкой ввода рисуется
+    анимированная строка статуса (как «· Thinking…» в Claude Code), слева, в
+    потоке; refresh_interval перерисовывает её → анимация. Когда свободен —
+    остаётся только зелёная стрелка. Строка статуса исчезает по завершении."""
+    arrow = "\x1b[1;32m› \x1b[0m"
+    # ждём ответ пользователя (подтверждение/выбор) — жёлтая стрелка, без спиннера
+    if _status["asking"]:
+        return ANSI("\x1b[1;33m❯ \x1b[0m")
+    if not _status["busy"]:
+        return ANSI(arrow)
+    # кадр привязан к ВРЕМЕНИ (~10 кадров/с), а не к числу перерисовок — иначе
+    # _prompt_message зовётся по много раз за один redraw и анимация «дрожит».
+    # Точку-многоточие держим статичной (меняющаяся ширина .. → ... мерцала).
+    sp = _SPINNER[int(time.time() / 0.1) % len(_SPINNER)]
+    return ANSI(f"\x1b[36m{sp} {_status['text']}…\x1b[0m\n{arrow}")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +269,12 @@ def tool_run_command(command: str, timeout: int = 120, cwd: str = ".") -> str:
     out = out.strip() or "(нет вывода)"
     if len(out) > 30000:
         out = out[:30000] + "\n... [обрезано]"
-    return f"exit={r.returncode}\n{out}"
+    note = ""
+    if r.returncode != 0:
+        note = ("\n[note] Если это программа с окном/GUI и пользователь просто закрыл "
+                "окно — ненулевой код выхода и сообщения при закрытии нормальны, это не "
+                "ошибка в коде.")
+    return f"exit={r.returncode}\n{out}{note}"
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +426,16 @@ def tool_run_background(command: str, cwd: str = ".") -> str:
     _bg_procs[bid] = {"proc": proc, "output": [], "command": command}
     t = threading.Thread(target=_bg_reader, args=(bid, proc), daemon=True)
     t.start()
-    return (f"Запущен фоновый процесс id={bid}: {command}\n"
+    # короткая пауза: не упал ли процесс сразу (нет модуля, синтаксис, краш на старте)
+    time.sleep(1.5)
+    rc = proc.poll()
+    if rc is not None:
+        out = "".join(_bg_procs[bid]["output"])[-4000:].strip() or "(нет вывода)"
+        return (f"Процесс id={bid} завершился СРАЗУ с кодом {rc} — окно не открылось/не "
+                f"осталось работать, это ошибка запуска (не пиши пользователю, что окно "
+                f"открылось). Разбери вывод и устрани причину (напр. поставь зависимость "
+                f"через pip install …, потом запусти снова):\n{out}")
+    return (f"Запущен фоновый процесс id={bid}: {command} — работает. "
             f"Вывод смотри через read_output(id={bid}), останови через kill_process.")
 
 
@@ -684,6 +763,11 @@ SYSTEM_PROMPT = (
     "multi_edit. Долгие процессы (серверы, watch) запускай через run_background и "
     "смотри вывод через read_output. Доступны файловые операции (make_dir, move, "
     "copy, delete), git (git_status/git_diff/git_commit) и web_fetch для доков.\n"
+    "Программы с окном/GUI (игры, tkinter, pygame, браузерные), серверы и любые "
+    "интерактивные процессы запускай через run_background, а НЕ run_command: "
+    "run_command блокируется, пока пользователь не закроет окно. Когда пользователь "
+    "закрывает окно — это нормальное завершение, НЕ ошибка; ненулевой код выхода или "
+    "сообщение при закрытии окна не считай багом и не пытайся «чинить» рабочий код.\n"
     "Когда задача выполнена, дай краткий итог обычным текстом, не вызывая инструменты."
 )
 
@@ -843,9 +927,13 @@ def confirm_batch(calls: list) -> str:
              for tc in calls]
     title = "Выполнить операцию?" if len(calls) == 1 else f"Выполнить {len(calls)} операции?"
     console.print(Panel("\n".join(lines), title=f"[yellow]{title}[/]", border_style="yellow"))
-    ans = ASK("[y]да / [n]нет / [a]больше не спрашивать: ").strip().lower()
-    first = ans[:1] or "y"
-    return {"n": "no", "a": "always"}.get(first, "yes")
+    ans = ASK("[yellow](y)[/] да   [yellow](n)[/] нет   [yellow](a)[/] больше не спрашивать: ")
+    first = (ans.strip().lower()[:1] or "y")
+    if first in ("n", "н"):
+        return "no"
+    if first in ("a", "а"):   # латинская a и кириллическая а
+        return "always"
+    return "yes"
 
 
 # ---------------------------------------------------------------------------
@@ -855,14 +943,48 @@ def confirm_batch(calls: list) -> str:
 # Осиротевшие маркеры тела (@@поле@@ / @@end@@ в начале строки) — признак того,
 # что модель пыталась вызвать инструмент по нашему протоколу, но сломала формат.
 _BROKEN_CALL_RE = re.compile(r"(?m)^@@(?:end|[A-Za-z_]\w*)@@\s*$")
+# Алиса иногда «рассказывает» о вызове словами вместо реального tool_call:
+# «[Ассистент вызвал] read_file(...)», «Вызываю read_file(...)» и т.п.
+_NARRATED_CALL_RE = re.compile(
+    r"\[\s*(?:ассистент|assistant)[^\]]*?(?:вы[зч]|call)", re.IGNORECASE)
+# Строка вида «toolname(...)» в начале строки, где toolname — настоящий инструмент.
+_TOOLCALL_LINE_RE = re.compile(
+    r"(?m)^\s*(?:" + "|".join(re.escape(k) for k in TOOLS_IMPL) + r")\s*\(")
 
 
 def _looks_like_broken_call(text: str) -> bool:
     """Похоже на попытку вызова, которую парсер не смог распознать: остался фенс
-    tool_call или осиротевшие маркеры тела."""
+    tool_call, осиротевшие маркеры тела, или вызов «рассказан» текстом."""
     if not text:
         return False
-    return "```tool_call" in text or bool(_BROKEN_CALL_RE.search(text))
+    return ("```tool_call" in text
+            or bool(_BROKEN_CALL_RE.search(text))
+            or bool(_NARRATED_CALL_RE.search(text))
+            or bool(_TOOLCALL_LINE_RE.search(text)))
+
+
+def _create_with_retry(client: OpenAI, **kw):
+    """Вызов модели с ретраями на временных сетевых ошибках: адаптер/WS Алисы
+    иногда роняет соединение. До 4 попыток с нарастающей паузой, чтобы ход не
+    терялся из-за разрыва."""
+    last = None
+    for attempt in range(4):
+        try:
+            return client.chat.completions.create(**kw)
+        except Exception as e:
+            last = e
+            msg = str(e).lower()
+            transient = (isinstance(e, (APIConnectionError, APITimeoutError))
+                         or "connection" in msg or "timeout" in msg
+                         or "remote" in msg or "reset" in msg)
+            if not transient or attempt == 3:
+                raise
+            wait = 1.5 * (attempt + 1)
+            set_thinking(True, "переподключаюсь")
+            console.print(f"[yellow]Соединение прервалось — повтор через {wait:.0f}с "
+                          f"(попытка {attempt + 2}/4)…[/]")
+            time.sleep(wait)
+    raise last
 
 
 def agent_turn(client: OpenAI, messages: list, trust: "Trust",
@@ -877,9 +999,9 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
         if pending_att:
             extra["attachments"] = pending_att
             pending_att = None
-        console.print("[dim cyan]⏳ Alice думает…[/]")
-        resp = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
+        set_thinking(True, "Alice думает")
+        resp = _create_with_retry(
+            client, model=MODEL, messages=messages, tools=TOOLS_SCHEMA, extra_body=extra,
         )
         msg = resp.choices[0].message
 
@@ -891,11 +1013,12 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
                 console.print("[yellow]Вызов инструмента сломан — прошу Алису повторить…[/]")
                 messages.append({"role": "assistant", "content": msg.content})
                 messages.append({"role": "user", "content":
-                    "Твой вызов инструмента не распознан — формат сломан. Повтори его "
-                    "СТРОГО блоком ```tool_call``` с корректным JSON (поля name и "
-                    "arguments). Большой текст (content/old/new) выноси телом между "
-                    "@@поле@@ и @@end@@, без обрамления тройными кавычками. "
-                    "Ничего лишнего вокруг блока."})
+                    "Твой вызов инструмента не распознан. НЕ описывай вызов словами и не "
+                    "пиши «[Ассистент вызвал] …» или «toolname(...)» текстом — это не "
+                    "выполняется. Сделай НАСТОЯЩИЙ вызов: строго блоком ```tool_call``` с "
+                    "корректным JSON (поля name и arguments). Большой текст "
+                    "(content/old/new) выноси телом между @@поле@@ и @@end@@, без "
+                    "обрамления тройными кавычками. Ничего лишнего вокруг блока."})
                 continue
             # финальный ответ
             if msg.content:
@@ -932,6 +1055,7 @@ def agent_turn(client: OpenAI, messages: list, trust: "Trust",
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+            set_thinking(True, f"{name}")
             console.print(f"[dim]→ {name}({_args_preview(tc.function.arguments)})[/]")
 
             if declined and tc in to_confirm:
@@ -1090,8 +1214,48 @@ def session_title(sess: dict) -> str:
     return "(пусто)"
 
 
+def _select_from_list(prompt_text: str, items: list) -> Optional[object]:
+    """Интерактивный выбор из списка: стрелками ↑/↓ по выпадающему меню (Enter —
+    выбрать), либо ввести номер. items: список (текст_для_показа, значение).
+    Читает ВВОД НАПРЯМУ́Ю (вызывается из потока-читателя — без очереди ответов,
+    иначе дедлок). Возвращает значение или None (Enter на пустом — отмена)."""
+    labels = [f"{i:>2}. {disp}" for i, (disp, _v) in enumerate(items, 1)]
+
+    class _LC(Completer):
+        def get_completions(self, document, complete_event):
+            t = document.text_before_cursor.strip().lower()
+            for idx, label in enumerate(labels, 1):
+                if not t or str(idx).startswith(t) or t in label.lower():
+                    yield Completion(str(idx), start_position=-len(document.text_before_cursor),
+                                     display=label)
+
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def _(event):
+        buff = event.current_buffer
+        cs = buff.complete_state
+        if cs is not None and cs.current_completion is not None:
+            buff.apply_completion(cs.current_completion)
+        buff.validate_and_handle()
+
+    sess: PromptSession = PromptSession(completer=_LC(), complete_while_typing=True,
+                                        key_bindings=kb)
+
+    def _pre_run() -> None:
+        sess.default_buffer.start_completion(select_first=False)
+
+    try:
+        ans = sess.prompt(prompt_text, pre_run=_pre_run).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if ans.isdigit() and 1 <= int(ans) <= len(items):
+        return items[int(ans) - 1][1]
+    return None
+
+
 def pick_session(arg: str, exclude_id: str = "") -> Optional[dict]:
-    """Выбрать сессию для /resume: по id-префиксу (arg) или из нумерованного списка."""
+    """Выбрать сессию для /resume: по id-префиксу (arg) или из списка (стрелки/номер)."""
     sessions = [s for s in load_sessions() if s.get("id") != exclude_id]
     if not sessions:
         console.print("[dim]Нет сохранённых сессий для возврата.[/]")
@@ -1102,21 +1266,13 @@ def pick_session(arg: str, exclude_id: str = "") -> Optional[dict]:
                 return s
         console.print(f"[yellow]Сессия '{arg}' не найдена.[/]")
         return None
-    console.print("[bold]Прошлые сессии:[/]")
     shown = sessions[:15]
-    for i, s in enumerate(shown, 1):
-        console.print(f"  [cyan]{i:>2}[/] [dim]{s.get('updated', '')}[/]  "
-                      f"{s['id']}  {session_title(s)}")
-    ans = ASK("Номер сессии (Enter — отмена): ").strip()
-    if not ans:
-        return None
-    if ans.isdigit() and 1 <= int(ans) <= len(shown):
-        return shown[int(ans) - 1]
-    for s in sessions:
-        if s["id"].startswith(ans):
-            return s
-    console.print("[yellow]Отмена.[/]")
-    return None
+    console.print("[bold]Прошлые сессии[/] [dim](↑/↓ + Enter, либо номер; Enter на пустом — отмена):[/]")
+    items = [(f"[{s.get('updated', '')}]  {s['id']}  {session_title(s)}", s) for s in shown]
+    chosen = _select_from_list("Сессия: ", items)
+    if chosen is None:
+        console.print("[yellow]Отмена.[/]")
+    return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1331,7 @@ def main() -> None:
     def ask_via_queue(prompt_text: str) -> str:
         console.print(prompt_text)
         confirm_mode.set()
+        _status["asking"] = True  # prompt покажет «ждёт ответа», не спиннер
         try:
             while not stop.is_set():
                 try:
@@ -1184,21 +1341,28 @@ def main() -> None:
             return ""
         finally:
             confirm_mode.clear()
+            _status["asking"] = False
 
     ASK = ask_via_queue
 
-    def handle_line(line: str) -> None:
+    def do_command(line: str) -> bool:
+        """Обрабатывает слэш-команды СРАЗУ (в потоке-читателе), не дожидаясь
+        очереди задач. Возвращает True, если строка была командой."""
         stripped = line.strip()
         cmd = stripped.lower()
+        if cmd == "/queue":
+            n = input_q.qsize()
+            console.print(f"[dim]В очереди: {n}[/]" if n else "[dim]Очередь пуста.[/]")
+            return True
         if cmd == "/clear":
             state["sess"] = new_session(sys_prompt)
             state["messages"] = state["sess"]["messages"]
             console.print(f"[dim]Новая сессия {state['sess']['id']} (контекст очищен).[/]")
-            return
+            return True
         if cmd == "/undo":
             if not _undo_stack:
                 console.print("[dim]Нечего откатывать.[/]")
-                return
+                return True
             snap = _undo_stack.pop()
             for path_str, prev in snap:
                 pp = Path(path_str)
@@ -1209,15 +1373,19 @@ def main() -> None:
                     pp.parent.mkdir(parents=True, exist_ok=True)
                     pp.write_bytes(prev)
             console.print(f"[green]Откат выполнен ({len(snap)} файлов).[/]")
-            return
+            return True
         if cmd == "/help":
             console.print(
-                "[dim]Опиши задачу обычным текстом. Можно печатать следующие задачи, "
-                "пока агент работает — они встанут в очередь. Ctrl+V — вставка пути к "
-                "файлу/скриншота.\n"
-                "/queue — показать очередь · /resume [id] — прошлая сессия · /clear — "
-                "новая · /undo — откат правки · /trust — подтверждения · /exit — выход.[/]")
-            return
+                "[dim]Опиши задачу обычным текстом. Команды срабатывают сразу, даже "
+                "пока агент работает. Можно печатать следующие задачи во время работы — "
+                "они встанут в очередь. Ctrl+V — вставка пути к файлу/скриншота.\n"
+                "/queue — очередь · /resume [id] — прошлая сессия · /clear — новая · "
+                "/undo — откат правки · /trust — подтверждения · /login — повторный вход · "
+                "/exit — выход.[/]")
+            return True
+        if cmd == "/login":
+            do_login()
+            return True
         if cmd == "/trust" or cmd.startswith("/trust "):
             arg = stripped[len("/trust"):].strip().lower()
             if arg in TRUST_MODES:
@@ -1228,7 +1396,7 @@ def main() -> None:
                               f"[dim]— {TRUST_MODES[trust.mode]}[/]")
                 for k, v in TRUST_MODES.items():
                     console.print(f"  [cyan]/trust {k}[/] — {v}")
-            return
+            return True
         if cmd == "/resume" or cmd.startswith("/resume "):
             chosen = pick_session(stripped[len("/resume"):].strip(),
                                   exclude_id=state["sess"]["id"])
@@ -1237,13 +1405,46 @@ def main() -> None:
                 state["messages"] = chosen["messages"]
                 console.print(f"[green]Вернулся в сессию {chosen['id']}[/] "
                               f"[dim]({session_title(chosen)})[/]")
+            return True
+        return False
+
+    def do_login() -> None:
+        """Принудительный повторный вход в Яндекс (откроется окно браузера),
+        затем перезапуск адаптера с новой сессией."""
+        nonlocal adapter
+        console.print("[dim]Открываю браузер для повторного входа в Яндекс…[/]")
+        try:
+            creds = alice_session.relogin_sync()
+        except Exception as e:
+            console.print(f"[red]Не удалось войти: {e}[/]")
             return
+        if creds.logged_in:
+            console.print("[green]Вход выполнен — режим Pro. Перезапускаю адаптер…[/]")
+        else:
+            console.print("[yellow]Окно закрыто без входа — остаюсь в Base. "
+                          "Перезапускаю адаптер…[/]")
+        try:
+            adapter.terminate()
+            adapter.wait(timeout=5)
+        except Exception:
+            try:
+                adapter.kill()
+            except Exception:
+                pass
+        adapter = start_adapter()
+        if wait_health():
+            console.print("[green]Адаптер перезапущен с новой сессией.[/]")
+        else:
+            console.print("[red]Адаптер не поднялся за 25с. Смотри adapter.log.[/]")
+
+    def handle_line(line: str) -> None:
+        stripped = line.strip()
         if not stripped:
             return
 
-        # блок «мой ввод» (зелёный) — отделяет задачу от вывода Алисы, особенно
-        # когда задач в очереди несколько
-        console.print(f"\n[bold green]▶ ты:[/] {stripped[:300]}")
+        # блок «мой ввод» — серая заливка-маркер (как выделение текста), отделяет
+        # задачу от вывода Алисы
+        console.print(f"\n[default on grey35] {stripped[:300]} [/]")
         sess_, messages_ = state["sess"], state["messages"]
         atts, cleaned = detect_attachments(line)
         if atts:
@@ -1252,22 +1453,22 @@ def main() -> None:
                               "content": cleaned.strip() or "Посмотри прикреплённый файл."})
         else:
             messages_.append({"role": "user", "content": line})
-        compact_history(client, messages_)
-        modified = agent_turn(client, messages_, trust, sess_["dialog_id"],
-                              attachments=atts or None)
-        if atts and messages_ and messages_[-1].get("role") == "assistant" \
-                and _is_processing(messages_[-1].get("content", "")):
-            console.print("[dim]Файл ещё обрабатывается — жду и переспрашиваю…[/]")
-            time.sleep(6)
-            messages_.append({"role": "user",
-                              "content": "Файл обработан? Ответь по его содержимому."})
-            modified = agent_turn(client, messages_, trust, sess_["dialog_id"]) or modified
-        if modified and VERIFY_CMD:
-            run_verification(client, messages_, trust, sess_["dialog_id"])
+        try:
+            compact_history(client, messages_)
+            modified = agent_turn(client, messages_, trust, sess_["dialog_id"],
+                                  attachments=atts or None)
+            if atts and messages_ and messages_[-1].get("role") == "assistant" \
+                    and _is_processing(messages_[-1].get("content", "")):
+                console.print("[dim]Файл ещё обрабатывается — жду и переспрашиваю…[/]")
+                time.sleep(6)
+                messages_.append({"role": "user",
+                                  "content": "Файл обработан? Ответь по его содержимому."})
+                modified = agent_turn(client, messages_, trust, sess_["dialog_id"]) or modified
+            if modified and VERIFY_CMD:
+                run_verification(client, messages_, trust, sess_["dialog_id"])
+        finally:
+            set_thinking(False)
         save_session(sess_)
-        rem = input_q.qsize()
-        if rem:
-            console.print(f"[dim](в очереди ещё {rem})[/]")
 
     def worker() -> None:
         while not stop.is_set():
@@ -1283,14 +1484,33 @@ def main() -> None:
                 console.print(f"[red]Ошибка: {e}[/]")
         stop.set()
 
+    def ticker() -> None:
+        # Гоняем перерисовку приглашения, пока агент занят: под patch_stdout на
+        # Windows авто-refresh prompt_toolkit во время «тихого» ожидания ответа
+        # модели не тикает (спиннер замирал). Форсим redraw из внешнего потока.
+        while not stop.is_set():
+            sess = _input_session
+            if sess is not None and (_status["busy"] or _status["asking"]):
+                try:
+                    app = sess.app
+                    loop = getattr(app, "loop", None)
+                    if getattr(app, "is_running", False) and loop is not None:
+                        loop.call_soon_threadsafe(app._redraw)
+                except Exception:
+                    pass
+            time.sleep(0.1)
+
     wt = threading.Thread(target=worker, daemon=True)
+    tk = threading.Thread(target=ticker, daemon=True)
     try:
         with patch_stdout():
             # rich пишет ANSI в _PTOutput -> prompt_toolkit интерпретирует цвета и
             # печатает над строкой ввода (цвета сохраняются, без мешанины).
             console = Console(file=_PTOutput(), force_terminal=True,
+                              color_system="256",
                               width=shutil.get_terminal_size((100, 30)).columns)
             wt.start()
+            tk.start()
             while not stop.is_set():
                 try:
                     line = read_user_input()
@@ -1299,15 +1519,19 @@ def main() -> None:
                 s = line.strip().lower()
                 if s in ("/exit", "/quit", "exit", "quit"):
                     break
+                # пока агент ждёт подтверждения/выбора — это ответ ему
                 if confirm_mode.is_set():
                     answer_q.put(line)
                     continue
-                if s == "/queue":
-                    console.print(f"[dim]В очереди: {input_q.qsize()}[/]")
+                # команды обрабатываем сразу, не кладя в очередь задач
+                if s.startswith("/") and do_command(line):
                     continue
                 input_q.put(line)
-                if input_q.qsize() > 1:
-                    console.print(f"[dim](в очереди: {input_q.qsize()})[/]")
+                # если агент сейчас занят — запрос ждёт отправки; показываем его
+                # как «ожидающий» (приглушённая заливка), как в claude code
+                if _status["busy"]:
+                    console.print(f"[grey50 on grey19] {line.strip()[:200]} [/] "
+                                  "[dim]· ожидает[/]")
     finally:
         stop.set()
         input_q.put(None)

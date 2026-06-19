@@ -234,6 +234,26 @@ async def refresh(interactive_ok: bool = True) -> Creds:
         return creds
 
 
+async def relogin() -> Creds:
+    """Принудительный повторный вход: ВСЕГДА открывает видимое окно браузера
+    (в отличие от refresh, который сперва пробует тихий headless). Результат
+    кэшируется и пишется на диск."""
+    global _CACHE
+    async with _lock():
+        creds = await _capture(headless=False, login_timeout=LOGIN_TIMEOUT)
+        if creds is None:
+            raise RuntimeError(
+                "Не удалось получить сессию Алисы через Playwright "
+                "(нет кадра SynchronizeState). Проверь сеть и доступ к alice.yandex.ru.")
+        _CACHE = creds
+        _save(creds)
+        return creds
+
+
+def relogin_sync() -> Creds:
+    return asyncio.run(relogin())
+
+
 async def get_credentials(force: bool = False) -> Creds:
     """Лучшие известные креды: env-override → кэш → диск → захват."""
     global _CACHE
