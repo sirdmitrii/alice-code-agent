@@ -45,9 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# force_terminal=True: чтобы цвета сохранялись и под patch_stdout (proxy stdout).
-# file=None -> rich пишет в ТЕКУЩИЙ sys.stdout, поэтому patch_stdout подхватывается сам.
-console = Console(force_terminal=True)
+console = Console()
 ROOT = Path(__file__).resolve().parent
 
 # Ввод через prompt_toolkit: bracketed paste включён по умолчанию, поэтому
@@ -1108,6 +1106,7 @@ def pick_session(arg: str, exclude_id: str = "") -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global ASK, console
     console.print(Panel.fit(
         f"[bold cyan]Alice Code[/]   модель: {MODEL}\n"
         f"папка: {PROJECT_DIR}\n"
@@ -1147,7 +1146,6 @@ def main() -> None:
     console.print(f"[dim]Новая сессия {sess['id']}. Уровень доверия: {trust.mode} "
                   f"({TRUST_MODES[trust.mode]}).[/]\n")
 
-    global ASK
     # ---- очередь ввода: читатель (этот поток) копит ввод, обработчик берёт по
     # порядку. Вывод не перетирает строку ввода благодаря patch_stdout. ----
     input_q: _queue.Queue = _queue.Queue()
@@ -1266,6 +1264,9 @@ def main() -> None:
 
     wt = threading.Thread(target=worker, daemon=True)
     try:
+        # под patch_stdout rich-ANSI печатается буквально (мешанина), поэтому
+        # выключаем цвет — вывод монохромный, но чистый. Рамки/markdown остаются.
+        console = Console(color_system=None)
         with patch_stdout():
             wt.start()
             while not stop.is_set():
